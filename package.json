@@ -1,0 +1,114 @@
+{
+  "name": "pi-selection",
+  "displayName": "Pi Selection",
+  "description": "Send selected code to background Pi sessions.",
+  "version": "0.0.6",
+  "private": true,
+  "publisher": "igorbedesqui",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:piSelection.submit",
+    "onView:piSelection.sessions"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "piSelection.submit",
+        "title": "Pi: Prompt About Selection"
+      },
+      {
+        "command": "piSelection.openSession",
+        "title": "Pi: Open Session"
+      },
+      {
+        "command": "piSelection.openParent",
+        "title": "Pi: Open Parent Session"
+      },
+      {
+        "command": "piSelection.abort",
+        "title": "Pi: Abort Session"
+      },
+      {
+        "command": "piSelection.clearCompleted",
+        "title": "Pi: Clear Finished Sessions"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "piSelection.submit",
+        "key": "ctrl+k",
+        "mac": "cmd+k",
+        "when": "editorTextFocus"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "piSelection.sessions",
+          "name": "Pi Sessions"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "piSelection.openParent",
+          "when": "view == piSelection.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "piSelection.clearCompleted",
+          "when": "view == piSelection.sessions",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "piSelection.openSession",
+          "when": "view == piSelection.sessions && viewItem == piSelection.finished",
+          "group": "inline@1"
+        },
+        {
+          "command": "piSelection.abort",
+          "when": "view == piSelection.sessions && viewItem == piSelection.running",
+          "group": "inline@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Pi Selection",
+      "properties": {
+        "piSelection.piPath": {
+          "type": "string",
+          "default": "pi",
+          "description": "Path to the Pi executable."
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "node --import tsx --test src/*.test.ts",
+    "check": "pnpm compile && pnpm test",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.100.0",
+    "@vscode/vsce": "^3.6.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,280 @@
+import * as path from "node:path";
+import * as vscode from "vscode";
+import { BufferBridge } from "./bridge";
+import { PiCoordinator, type PiJob, type SelectionRequest } from "./coordinator";
+import { SessionInlays } from "./session-inlays";
+import { PI_SELECTION_SYSTEM_PROMPT } from "./system-prompt";
+
+class SessionTree implements vscode.TreeDataProvider<PiJob> {
+  private readonly changed = new vscode.EventEmitter<PiJob | undefined>();
+  readonly onDidChangeTreeData = this.changed.event;
+
+  constructor(private readonly coordinators: Map<string, PiCoordinator>) {}
+
+  refresh(): void {
+    this.changed.fire(undefined);
+  }
+
+  getChildren(): PiJob[] {
+    return [...this.coordinators.values()].flatMap((coordinator) => [...coordinator.list()]);
+  }
+
+  getTreeItem(job: PiJob): vscode.TreeItem {
+    const item = new vscode.TreeItem(job.name, vscode.TreeItemCollapsibleState.None);
+    item.description = `${job.file} · ${job.detail}`;
+    item.contextValue = ["queued", "running"].includes(job.status)
+      ? "piSelection.running"
+      : "piSelection.finished";
+    item.iconPath = new vscode.ThemeIcon(
+      job.status === "queued" || job.status === "running"
+        ? "loading~spin"
+        : job.status === "completed"
+          ? "pass"
+          : job.status === "aborted"
+            ? "circle-slash"
+            : "error",
+    );
+    item.tooltip = new vscode.MarkdownString(
+      [
+        `**${job.name}**`,
+        `${job.file} — ${job.detail}`,
+        job.error,
+        job.response ? `---\n\n${job.response}` : undefined,
+      ]
+        .filter((line) => line !== undefined)
+        .join("\n\n"),
+    );
+    if (job.sessionFile && !["queued", "running"].includes(job.status)) {
+      item.command = {
+        command: "piSelection.openSession",
+        title: "Open Pi Session",
+        arguments: [job],
+      };
+    }
+    return item;
+  }
+}
+
+function refreshFeed(job: PiJob, quickPick: vscode.QuickPick<vscode.QuickPickItem>): void {
+  quickPick.title = `Pi: ${job.name} · ${job.detail}`;
+  quickPick.placeholder = job.sessionFile
+    ? "Select any feed entry to open this session in its terminal editor"
+    : "The Pi session is still being created";
+  quickPick.items = job.feed.map((entry, index) => {
+    const [firstLine, ...rest] = entry.split("\n");
+    return {
+      label: `${index === job.feed.length - 1 ? "$(circle-filled)" : "$(circle-outline)"} ${firstLine || job.detail}`,
+      detail: rest.join("\n").slice(0, 2_000) || undefined,
+    };
+  });
+}
+
+export function activate(context: vscode.ExtensionContext): void {
+  const coordinators = new Map<string, PiCoordinator>();
+  const output = vscode.window.createOutputChannel("Pi Selection");
+  const tree = new SessionTree(coordinators);
+  const inlays = new SessionInlays();
+  const terminals = new Map<string, vscode.Terminal>();
+  const terminalCreations = new Map<string, Promise<vscode.Terminal>>();
+  const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
+  const treeRegistration = vscode.window.registerTreeDataProvider("piSelection.sessions", tree);
+  const inlayRegistration = vscode.languages.registerInlayHintsProvider({ scheme: "file" }, inlays);
+
+  const coordinatorFor = (folder: vscode.WorkspaceFolder): PiCoordinator => {
+    const cwd = folder.uri.fsPath;
+    let coordinator = coordinators.get(cwd);
+    if (!coordinator) {
+      const piPath = vscode.workspace.getConfiguration("piSelection", folder.uri).get("piPath", "pi");
+      const bridge = new BufferBridge(folder);
+      coordinator = new PiCoordinator({
+        cwd,
+        piPath,
+        onChange: () => {
+          tree.refresh();
+          inlays.refresh();
+          for (const feed of feeds.values()) refreshFeed(feed.job, feed.quickPick);
+        },
+        log: (message) => output.appendLine(message),
+        childLaunch: async () => {
+          const connection = await bridge.start();
+          return {
+            args: [
+              "--no-extensions",
+              "--no-skills",
+              "--no-prompt-templates",
+              "--no-context-files",
+              "--extension",
+              context.asAbsolutePath("resources/pi-buffer-bridge.ts"),
+              "--tools",
+              "read,grep,find,ls,apply_patch",
+              "--system-prompt",
+              PI_SELECTION_SYSTEM_PROMPT,
+            ],
+            env: {
+              PI_SELECTION_BRIDGE_URL: connection.url,
+              PI_SELECTION_BRIDGE_TOKEN: connection.token,
+            },
+          };
+        },
+        disposeChild: () => bridge.dispose(),
+      });
+      coordinators.set(cwd, coordinator);
+      tree.refresh();
+    }
+    return coordinator;
+  };
+
+  const activeCoordinator = (): PiCoordinator | undefined => {
+    const editorFolder = vscode.window.activeTextEditor
+      ? vscode.workspace.getWorkspaceFolder(vscode.window.activeTextEditor.document.uri)
+      : undefined;
+    const folder = editorFolder ?? vscode.workspace.workspaceFolders?.[0];
+    return folder ? coordinatorFor(folder) : undefined;
+  };
+
+  const openSession = async (sessionFile: string, name: string, cwd: string): Promise<void> => {
+    const existing = terminals.get(sessionFile);
+    if (existing && !existing.exitStatus) {
+      existing.show(false);
+      return;
+    }
+    const pending = terminalCreations.get(sessionFile);
+    if (pending) {
+      (await pending).show(false);
+      return;
+    }
+
+    const creation = (async () => {
+      const folder = vscode.workspace.workspaceFolders?.find((candidate) => candidate.uri.fsPath === cwd);
+      const piPath = vscode.workspace.getConfiguration("piSelection", folder?.uri).get("piPath", "pi");
+      const launch = await coordinators.get(cwd)?.childLaunchOptions();
+      const raced = terminals.get(sessionFile);
+      if (raced && !raced.exitStatus) return raced;
+      const terminal = vscode.window.createTerminal({
+        name,
+        cwd,
+        shellPath: piPath,
+        shellArgs: [...(launch?.args ?? []), "--session", sessionFile],
+        env: launch?.env,
+        location: vscode.TerminalLocation.Editor,
+      });
+      terminals.set(sessionFile, terminal);
+      return terminal;
+    })();
+    terminalCreations.set(sessionFile, creation);
+    try {
+      (await creation).show(false);
+    } finally {
+      if (terminalCreations.get(sessionFile) === creation) terminalCreations.delete(sessionFile);
+    }
+  };
+
+  const showFeed = (job: PiJob): void => {
+    const existing = feeds.get(job.id);
+    if (existing) {
+      existing.quickPick.show();
+      return;
+    }
+    const quickPick = vscode.window.createQuickPick();
+    feeds.set(job.id, { job, quickPick });
+    refreshFeed(job, quickPick);
+    quickPick.onDidAccept(() => {
+      if (job.sessionFile) void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd);
+      quickPick.hide();
+    });
+    quickPick.onDidHide(() => {
+      feeds.delete(job.id);
+      quickPick.dispose();
+    });
+    quickPick.show();
+  };
+
+  context.subscriptions.push(
+    output,
+    inlays,
+    treeRegistration,
+    inlayRegistration,
+    vscode.window.onDidCloseTerminal((terminal) => {
+      for (const [sessionFile, candidate] of terminals) {
+        if (candidate === terminal) terminals.delete(sessionFile);
+      }
+    }),
+    vscode.commands.registerCommand("piSelection.submit", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) {
+        void vscode.window.showInformationMessage("Select some text first.");
+        return;
+      }
+      const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+      if (!folder) {
+        void vscode.window.showErrorMessage("Open the file inside a workspace folder first.");
+        return;
+      }
+
+      const selection = editor.selection;
+      const text = editor.document.getText(selection);
+      const request = await vscode.window.showInputBox({
+        title: "Prompt Pi about the selection",
+        prompt: `${path.relative(folder.uri.fsPath, editor.document.uri.fsPath)}:${selection.start.line + 1}-${selection.end.line + 1}`,
+        placeHolder: "what should change?",
+        ignoreFocusOut: true,
+      });
+      if (!request?.trim()) return;
+      if (editor.document.isDirty && !(await editor.document.save())) {
+        void vscode.window.showErrorMessage("Save the file before starting Pi.");
+        return;
+      }
+
+      const submission: SelectionRequest = {
+        instruction: request.trim(),
+        relativeFile: path.relative(folder.uri.fsPath, editor.document.uri.fsPath),
+        language: editor.document.languageId,
+        startLine: selection.start.line + 1,
+        endLine: selection.end.line + 1,
+        text,
+      };
+      const job = coordinatorFor(folder).submit(submission);
+      inlays.track(job, editor.document, editor.selection.end);
+      void vscode.window.setStatusBarMessage(`$(hubot) Pi started: ${job.name}`, 3_000);
+    }),
+    vscode.commands.registerCommand("piSelection.showFeed", (jobId: string) => {
+      const job = inlays.find(jobId);
+      if (job) showFeed(job);
+    }),
+    vscode.commands.registerCommand("piSelection.openSession", (job: PiJob) => {
+      if (job.sessionFile) void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd);
+    }),
+    vscode.commands.registerCommand("piSelection.abort", async (job: PiJob) => {
+      const coordinator = [...coordinators.values()].find((candidate) => candidate.list().includes(job));
+      await coordinator?.abort(job);
+    }),
+    vscode.commands.registerCommand("piSelection.openParent", async () => {
+      const coordinator = activeCoordinator();
+      if (!coordinator) {
+        void vscode.window.showErrorMessage("Open a workspace folder first.");
+        return;
+      }
+      try {
+        const folder = vscode.window.activeTextEditor
+          ? vscode.workspace.getWorkspaceFolder(vscode.window.activeTextEditor.document.uri)
+          : vscode.workspace.workspaceFolders?.[0];
+        const cwd = folder?.uri.fsPath ?? process.cwd();
+        const sessionFile = await coordinator.parentSession();
+        await openSession(sessionFile, "Pi: selection parent", cwd);
+      } catch (error) {
+        void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+      }
+    }),
+    vscode.commands.registerCommand("piSelection.clearCompleted", () => {
+      for (const coordinator of coordinators.values()) coordinator.clearFinished();
+      inlays.removeFinished();
+    }),
+    {
+      dispose: () => {
+        void Promise.all([...coordinators.values()].map((coordinator) => coordinator.dispose()));
+      },
+    },
+  );
+}
+
+export function deactivate(): void {}
