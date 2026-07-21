@@ -31,6 +31,7 @@ export type PiJob = {
   streamingFeedIndex?: number;
   client?: RpcClient;
   abortRequested?: boolean;
+  projected?: boolean;
 };
 
 type CoordinatorOptions = {

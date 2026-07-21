@@ -53,9 +53,16 @@ export class SessionInlays implements vscode.InlayHintsProvider, vscode.Disposab
     return this.markers.get(jobId)?.job;
   }
 
+  remove(jobId: string): void {
+    this.markers.delete(jobId);
+    this.refresh();
+  }
+
   removeFinished(): void {
     for (const [jobId, { job }] of this.markers) {
-      if (!["queued", "running"].includes(job.status)) this.markers.delete(jobId);
+      if (!job.projected && !["queued", "running"].includes(job.status)) {
+        this.markers.delete(jobId);
+      }
     }
     this.refresh();
   }

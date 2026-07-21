@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.0.6",
+  "version": "0.1.0",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -13,6 +13,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:piSelection.submit",
     "onView:piSelection.sessions"
   ],
@@ -38,6 +39,11 @@
       {
         "command": "piSelection.clearCompleted",
         "title": "Pi: Clear Finished Sessions"
+      },
+      {
+        "command": "piSelection.markReviewed",
+        "title": "Mark Reviewed",
+        "icon": "$(check)"
       }
     ],
     "keybindings": [
@@ -80,6 +86,13 @@
           "when": "view == piSelection.sessions && viewItem == piSelection.running",
           "group": "inline@1"
         }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "piSelection.markReviewed",
+          "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
+          "group": "inline"
+        }
       ]
     },
     "configuration": {
@@ -89,6 +102,11 @@
           "type": "string",
           "default": "pi",
           "description": "Path to the Pi executable."
+        },
+        "piSelection.agentationServerUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4748",
+          "description": "Base URL of the independent Agentation projection server."
         }
       }
     }

@@ -1,7 +1,9 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { AgentationProjectionClient } from "./agentation";
 import { BufferBridge } from "./bridge";
 import { PiCoordinator, type PiJob, type SelectionRequest } from "./coordinator";
+import { ProjectionController } from "./projection";
 import { SessionInlays } from "./session-inlays";
 import { PI_SELECTION_SYSTEM_PROMPT } from "./system-prompt";
 
@@ -9,22 +11,30 @@ class SessionTree implements vscode.TreeDataProvider<PiJob> {
   private readonly changed = new vscode.EventEmitter<PiJob | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
 
-  constructor(private readonly coordinators: Map<string, PiCoordinator>) {}
+  constructor(
+    private readonly coordinators: Map<string, PiCoordinator>,
+    private readonly projectedJobs: () => PiJob[],
+  ) {}
 
   refresh(): void {
     this.changed.fire(undefined);
   }
 
   getChildren(): PiJob[] {
-    return [...this.coordinators.values()].flatMap((coordinator) => [...coordinator.list()]);
+    return [
+      ...this.projectedJobs(),
+      ...[...this.coordinators.values()].flatMap((coordinator) => [...coordinator.list()]),
+    ];
   }
 
   getTreeItem(job: PiJob): vscode.TreeItem {
     const item = new vscode.TreeItem(job.name, vscode.TreeItemCollapsibleState.None);
     item.description = `${job.file} · ${job.detail}`;
-    item.contextValue = ["queued", "running"].includes(job.status)
-      ? "piSelection.running"
-      : "piSelection.finished";
+    item.contextValue = job.projected
+      ? "piSelection.projected"
+      : ["queued", "running"].includes(job.status)
+        ? "piSelection.running"
+        : "piSelection.finished";
     item.iconPath = new vscode.ThemeIcon(
       job.status === "queued" || job.status === "running"
         ? "loading~spin"
@@ -72,11 +82,33 @@ function refreshFeed(job: PiJob, quickPick: vscode.QuickPick<vscode.QuickPickIte
 export function activate(context: vscode.ExtensionContext): void {
   const coordinators = new Map<string, PiCoordinator>();
   const output = vscode.window.createOutputChannel("Pi Selection");
-  const tree = new SessionTree(coordinators);
   const inlays = new SessionInlays();
+  const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
+  let projection: ProjectionController;
+  const tree = new SessionTree(coordinators, () => projection?.list() ?? []);
+  projection = new ProjectionController(
+    inlays,
+    () => {
+      tree.refresh();
+      for (const feed of feeds.values()) refreshFeed(feed.job, feed.quickPick);
+    },
+    (message) => output.appendLine(message),
+  );
   const terminals = new Map<string, vscode.Terminal>();
   const terminalCreations = new Map<string, Promise<vscode.Terminal>>();
-  const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
+  let projectionClient: AgentationProjectionClient | undefined;
+  const connectProjection = (): void => {
+    projectionClient?.dispose();
+    const serverUrl = vscode.workspace
+      .getConfiguration("piSelection")
+      .get("agentationServerUrl", "http://127.0.0.1:4748");
+    projectionClient = new AgentationProjectionClient(
+      serverUrl,
+      (event) => projection.handle(event),
+      (message) => output.appendLine(`[Agentation] ${message}`),
+    );
+  };
+  connectProjection();
   const treeRegistration = vscode.window.registerTreeDataProvider("piSelection.sessions", tree);
   const inlayRegistration = vscode.languages.registerInlayHintsProvider({ scheme: "file" }, inlays);
 
@@ -132,7 +164,12 @@ export function activate(context: vscode.ExtensionContext): void {
     return folder ? coordinatorFor(folder) : undefined;
   };
 
-  const openSession = async (sessionFile: string, name: string, cwd: string): Promise<void> => {
+  const openSession = async (
+    sessionFile: string,
+    name: string,
+    cwd: string,
+    projected = false,
+  ): Promise<void> => {
     const existing = terminals.get(sessionFile);
     if (existing && !existing.exitStatus) {
       existing.show(false);
@@ -147,7 +184,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const creation = (async () => {
       const folder = vscode.workspace.workspaceFolders?.find((candidate) => candidate.uri.fsPath === cwd);
       const piPath = vscode.workspace.getConfiguration("piSelection", folder?.uri).get("piPath", "pi");
-      const launch = await coordinators.get(cwd)?.childLaunchOptions();
+      const launch = projected ? undefined : await coordinators.get(cwd)?.childLaunchOptions();
       const raced = terminals.get(sessionFile);
       if (raced && !raced.exitStatus) return raced;
       const terminal = vscode.window.createTerminal({
@@ -179,7 +216,9 @@ export function activate(context: vscode.ExtensionContext): void {
     feeds.set(job.id, { job, quickPick });
     refreshFeed(job, quickPick);
     quickPick.onDidAccept(() => {
-      if (job.sessionFile) void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd);
+      if (job.sessionFile) {
+        void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd, job.projected);
+      }
       quickPick.hide();
     });
     quickPick.onDidHide(() => {
@@ -192,8 +231,13 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output,
     inlays,
+    projection,
     treeRegistration,
     inlayRegistration,
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("piSelection.agentationServerUrl")) connectProjection();
+    }),
+    { dispose: () => projectionClient?.dispose() },
     vscode.window.onDidCloseTerminal((terminal) => {
       for (const [sessionFile, candidate] of terminals) {
         if (candidate === terminal) terminals.delete(sessionFile);
@@ -242,8 +286,14 @@ export function activate(context: vscode.ExtensionContext): void {
       if (job) showFeed(job);
     }),
     vscode.commands.registerCommand("piSelection.openSession", (job: PiJob) => {
-      if (job.sessionFile) void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd);
+      if (job.sessionFile) {
+        void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd, job.projected);
+      }
     }),
+    vscode.commands.registerCommand(
+      "piSelection.markReviewed",
+      (thread: vscode.CommentThread) => projection.markReviewed(thread),
+    ),
     vscode.commands.registerCommand("piSelection.abort", async (job: PiJob) => {
       const coordinator = [...coordinators.values()].find((candidate) => candidate.list().includes(job));
       await coordinator?.abort(job);
