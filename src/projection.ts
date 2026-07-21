@@ -21,6 +21,7 @@ import {
 
 type ProjectedReview = {
   key: string;
+  taskId: string;
   signature: string;
   job: PiJob;
   thread: vscode.CommentThread;
@@ -71,7 +72,32 @@ export class ProjectionController implements vscode.Disposable {
     return [...this.tasks.values()].map(({ job }) => job);
   }
 
+  snapshotFor(target: unknown): AgentationSnapshot | undefined {
+    const threadReview = this.reviews.get(target as vscode.CommentThread);
+    if (threadReview) return this.tasks.get(threadReview.taskId)?.state.snapshot;
+    const targetId = (target as { id?: unknown })?.id;
+    const anchorReview = [...this.reviews.values()].find(
+      (review) => review.job === target || review.job.id === targetId,
+    );
+    if (anchorReview) return this.tasks.get(anchorReview.taskId)?.state.snapshot;
+    return [...this.tasks.values()].find(
+      (task) => task.job === target || task.job.id === targetId,
+    )?.state.snapshot;
+  }
+
+  hasChanges(job: PiJob): boolean {
+    return Boolean(this.snapshotFor(job)?.changes?.length);
+  }
+
   handle(event: AgentationEvent): void {
+    if (event.type === "projection.reset") {
+      this.reset();
+      return;
+    }
+    if (event.type === "task.remove") {
+      this.removeTask(event.taskId);
+      return;
+    }
     const task = this.tasks.get(event.taskId);
     if (!task) {
       const state = projectSnapshot(undefined, event);
@@ -98,6 +124,12 @@ export class ProjectionController implements vscode.Disposable {
     this.onChange();
   }
 
+  reset(): void {
+    for (const task of [...this.tasks.values()]) this.disposeTask(task);
+    this.reviews.clear();
+    this.refreshProjectionViews();
+  }
+
   markReviewed(thread: vscode.CommentThread): void {
     const review = this.reviews.get(thread);
     if (!review || review.reviewed) return;
@@ -113,6 +145,25 @@ export class ProjectionController implements vscode.Disposable {
     this.reviews.clear();
     this.comments.dispose();
     this.decoration.dispose();
+  }
+
+  private removeTask(taskId: string): void {
+    const task = this.tasks.get(taskId);
+    if (task) this.disposeTask(task);
+    this.refreshProjectionViews();
+  }
+
+  private disposeTask(task: ProjectedTask): void {
+    task.desiredAnchors.clear();
+    task.pendingAnchors.clear();
+    for (const review of [...task.reviews.values()]) this.removeReview(task, review);
+    this.tasks.delete(task.id);
+  }
+
+  private refreshProjectionViews(): void {
+    this.refreshDecorations();
+    this.inlays.refresh();
+    this.onChange();
   }
 
   private syncAnchors(task: ProjectedTask): void {
@@ -196,6 +247,7 @@ export class ProjectionController implements vscode.Disposable {
       const job = createAnchorJob(task, annotation, key, resolved);
       const review: ProjectedReview = {
         key,
+        taskId: task.id,
         signature,
         job,
         thread,

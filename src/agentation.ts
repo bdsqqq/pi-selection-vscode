@@ -8,12 +8,17 @@ export type AgentationAnnotation = {
   reactComponents?: string;
 };
 
+export type AgentationChange = {
+  path: string;
+};
+
 export type AgentationSnapshot = {
   type: "task.snapshot";
   taskId: string;
   cwd: string;
   url?: string;
   annotations: AgentationAnnotation[];
+  changes?: AgentationChange[];
   status: "queued" | "running" | "completed" | "failed";
   detail: string;
   markdown?: string;
@@ -21,7 +26,17 @@ export type AgentationSnapshot = {
   error?: string;
 };
 
-export type AgentationEvent = AgentationSnapshot;
+export type AgentationReset = {
+  type: "projection.reset";
+  generation: string;
+};
+
+export type AgentationRemove = {
+  type: "task.remove";
+  taskId: string;
+};
+
+export type AgentationEvent = AgentationRemove | AgentationReset | AgentationSnapshot;
 
 export type SnapshotProjectionState = {
   snapshot: AgentationSnapshot;
@@ -136,13 +151,26 @@ export class AgentationProjectionClient {
   private consume(records: readonly string[]): void {
     for (const record of records) {
       try {
-        const event = JSON.parse(record) as AgentationEvent;
-        if (!isAgentationSnapshot(event)) throw new Error("event is not a task.snapshot");
-        this.onEvent(event);
+        this.onEvent(parseAgentationEvent(record));
       } catch (error) {
         this.onError(`invalid agentation projection event: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+  }
+
+  async fetchProjectionContent(
+    taskId: string,
+    changePath: string,
+    side: "before" | "after",
+  ): Promise<string> {
+    const response = await fetch(projectionContentUrl(this.serverUrl, taskId, changePath, side), {
+      headers: { accept: "text/plain" },
+      signal: this.controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`agentation projection content returned HTTP ${response.status}`);
+    }
+    return response.text();
   }
 
   private delay(ms: number): Promise<void> {
@@ -176,6 +204,49 @@ function ensureTrailingSlash(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
 }
 
+export function projectionContentUrl(
+  serverUrl: string,
+  taskId: string,
+  changePath: string,
+  side: "before" | "after",
+): URL {
+  const endpoint = new URL("/projection-content", ensureTrailingSlash(serverUrl));
+  endpoint.searchParams.set("taskId", taskId);
+  endpoint.searchParams.set("path", changePath);
+  endpoint.searchParams.set("side", side);
+  return endpoint;
+}
+
+export function parseAgentationEvent(record: string): AgentationEvent {
+  const event: unknown = JSON.parse(record);
+  if (isAgentationRemove(event) || isAgentationReset(event) || isAgentationSnapshot(event)) {
+    return event;
+  }
+  throw new Error("event is not a projection.reset, task.remove, or task.snapshot");
+}
+
+function isAgentationRemove(value: unknown): value is AgentationRemove {
+  if (!value || typeof value !== "object") return false;
+  const remove = value as Partial<AgentationRemove>;
+  return (
+    remove.type === "task.remove" &&
+    typeof remove.taskId === "string" &&
+    remove.taskId.length > 0 &&
+    Object.keys(remove).length === 2
+  );
+}
+
+function isAgentationReset(value: unknown): value is AgentationReset {
+  if (!value || typeof value !== "object") return false;
+  const reset = value as Partial<AgentationReset>;
+  return (
+    reset.type === "projection.reset" &&
+    typeof reset.generation === "string" &&
+    reset.generation.length > 0 &&
+    Object.keys(reset).length === 2
+  );
+}
+
 function isAgentationSnapshot(value: unknown): value is AgentationSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<AgentationSnapshot>;
@@ -192,6 +263,16 @@ function isAgentationSnapshot(value: unknown): value is AgentationSnapshot {
         typeof annotation.comment === "string" &&
         (annotation.reactComponents === undefined || typeof annotation.reactComponents === "string"),
     ) &&
+    (snapshot.changes === undefined ||
+      (Array.isArray(snapshot.changes) &&
+        snapshot.changes.every(
+          (change) =>
+            change !== null &&
+            typeof change === "object" &&
+            Object.keys(change).length === 1 &&
+            typeof (change as { path?: unknown }).path === "string" &&
+            (change as { path: string }).path.length > 0,
+        ))) &&
     ["queued", "running", "completed", "failed"].includes(snapshot.status ?? "") &&
     typeof snapshot.detail === "string" &&
     (snapshot.markdown === undefined || typeof snapshot.markdown === "string") &&

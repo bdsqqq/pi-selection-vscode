@@ -1,9 +1,20 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { AgentationProjectionClient } from "./agentation";
+import {
+  AgentationProjectionClient,
+  type AgentationChange,
+  type AgentationSnapshot,
+} from "./agentation";
 import { BufferBridge } from "./bridge";
 import { PiCoordinator, type PiJob, type SelectionRequest } from "./coordinator";
 import { ProjectionController } from "./projection";
+import {
+  parseProjectionUri,
+  PROJECTION_SCHEME,
+  projectionUriParts,
+  ProjectionUriRegistry,
+  Utf8LruCache,
+} from "./review-content";
 import { SessionInlays } from "./session-inlays";
 import { PI_SELECTION_SYSTEM_PROMPT } from "./system-prompt";
 
@@ -14,6 +25,7 @@ class SessionTree implements vscode.TreeDataProvider<PiJob> {
   constructor(
     private readonly coordinators: Map<string, PiCoordinator>,
     private readonly projectedJobs: () => PiJob[],
+    private readonly projectedHasChanges: (job: PiJob) => boolean,
   ) {}
 
   refresh(): void {
@@ -54,7 +66,13 @@ class SessionTree implements vscode.TreeDataProvider<PiJob> {
         .filter((line) => line !== undefined)
         .join("\n\n"),
     );
-    if (job.sessionFile && !["queued", "running"].includes(job.status)) {
+    if (job.projected && this.projectedHasChanges(job)) {
+      item.command = {
+        command: "piSelection.reviewChanges",
+        title: "Review Changes",
+        arguments: [job],
+      };
+    } else if (job.sessionFile && !["queued", "running"].includes(job.status)) {
       item.command = {
         command: "piSelection.openSession",
         title: "Open Pi Session",
@@ -62,6 +80,107 @@ class SessionTree implements vscode.TreeDataProvider<PiJob> {
       };
     }
     return item;
+  }
+}
+
+class ProjectionContentProvider implements vscode.TextDocumentContentProvider, vscode.Disposable {
+  private readonly contents = new Utf8LruCache(20 * 1024 * 1024, 40);
+  private readonly pending = new Map<string, Promise<string>>();
+  private readonly loadedUris = new ProjectionUriRegistry<vscode.Uri>();
+  private readonly expiredUris = new Set<string>();
+  private readonly keyEpochs = new Map<string, number>();
+  private readonly changed = new vscode.EventEmitter<vscode.Uri>();
+  private generation?: string;
+  private epoch = 0;
+  readonly onDidChange = this.changed.event;
+
+  constructor(private readonly client: () => AgentationProjectionClient | undefined) {}
+
+  provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
+    return this.fetch(uri, false);
+  }
+
+  async load(
+    snapshot: AgentationSnapshot,
+    change: AgentationChange,
+  ): Promise<{ before: vscode.Uri; after: vscode.Uri }> {
+    if (!this.generation) throw new Error("Projection generation is not available yet.");
+    const before = vscode.Uri.from(
+      projectionUriParts(this.generation, snapshot.taskId, change.path, "before"),
+    );
+    const after = vscode.Uri.from(
+      projectionUriParts(this.generation, snapshot.taskId, change.path, "after"),
+    );
+    this.expiredUris.delete(before.toString());
+    this.expiredUris.delete(after.toString());
+    await Promise.all([this.fetch(before, true), this.fetch(after, true)]);
+    return { before, after };
+  }
+
+  reset(generation: string): void {
+    const staleUris = this.loadedUris.reset();
+    this.epoch += 1;
+    this.generation = generation;
+    this.contents.clear();
+    this.pending.clear();
+    this.expiredUris.clear();
+    this.keyEpochs.clear();
+    for (const uri of staleUris) this.changed.fire(uri);
+  }
+
+  removeTask(taskId: string): void {
+    for (const [key, uri] of this.loadedUris.removeTask(taskId)) {
+      this.contents.delete(key);
+      this.pending.delete(key);
+      this.expiredUris.add(key);
+      this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
+      this.changed.fire(uri);
+    }
+  }
+
+  dispose(): void {
+    this.epoch += 1;
+    this.contents.clear();
+    this.pending.clear();
+    this.loadedUris.clear();
+    this.expiredUris.clear();
+    this.keyEpochs.clear();
+    this.changed.dispose();
+  }
+
+  private async fetch(uri: vscode.Uri, refresh: boolean): Promise<string> {
+    const key = uri.toString();
+    const target = parseProjectionUri(uri);
+    if (!target) throw new Error(`invalid projection content URI: ${key}`);
+    if (target.generation !== this.generation) {
+      throw new Error("This review expired when the server projection reset.");
+    }
+    if (this.expiredUris.has(key)) throw new Error("This review task was removed.");
+    this.loadedUris.remember(key, uri);
+    const previous = this.contents.get(key);
+    if (!refresh && previous !== undefined) return previous;
+    const pending = this.pending.get(key);
+    if (pending) return pending;
+    const client = this.client();
+    if (!client) throw new Error("Agentation projection client is not connected.");
+    const epoch = this.epoch;
+    const keyEpoch = this.keyEpochs.get(key) ?? 0;
+    const request = (async () => {
+      const content = await client.fetchProjectionContent(target.taskId, target.path, target.side);
+      if (this.epoch !== epoch) throw new Error("This review expired when the server projection reset.");
+      if ((this.keyEpochs.get(key) ?? 0) !== keyEpoch) {
+        throw new Error("This review task was removed.");
+      }
+      this.contents.set(key, content);
+      if (refresh && previous !== undefined && previous !== content) this.changed.fire(uri);
+      return content;
+    })();
+    this.pending.set(key, request);
+    try {
+      return await request;
+    } finally {
+      if (this.pending.get(key) === request) this.pending.delete(key);
+    }
   }
 }
 
@@ -85,7 +204,11 @@ export function activate(context: vscode.ExtensionContext): void {
   const inlays = new SessionInlays();
   const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
   let projection: ProjectionController;
-  const tree = new SessionTree(coordinators, () => projection?.list() ?? []);
+  const tree = new SessionTree(
+    coordinators,
+    () => projection?.list() ?? [],
+    (job) => projection?.hasChanges(job) ?? false,
+  );
   projection = new ProjectionController(
     inlays,
     () => {
@@ -97,6 +220,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const terminals = new Map<string, vscode.Terminal>();
   const terminalCreations = new Map<string, Promise<vscode.Terminal>>();
   let projectionClient: AgentationProjectionClient | undefined;
+  const projectionContent = new ProjectionContentProvider(() => projectionClient);
   const connectProjection = (): void => {
     projectionClient?.dispose();
     const serverUrl = vscode.workspace
@@ -104,13 +228,35 @@ export function activate(context: vscode.ExtensionContext): void {
       .get("agentationServerUrl", "http://127.0.0.1:4748");
     projectionClient = new AgentationProjectionClient(
       serverUrl,
-      (event) => projection.handle(event),
+      (event) => {
+        if (event.type === "projection.reset") {
+          projectionContent.reset(event.generation);
+          for (const feed of feeds.values()) {
+            if (feed.job.projected) feed.quickPick.hide();
+          }
+        } else if (event.type === "task.remove") {
+          projectionContent.removeTask(event.taskId);
+          for (const feed of feeds.values()) {
+            if (
+              feed.job.projected &&
+              projection.snapshotFor(feed.job)?.taskId === event.taskId
+            ) {
+              feed.quickPick.hide();
+            }
+          }
+        }
+        projection.handle(event);
+      },
       (message) => output.appendLine(`[Agentation] ${message}`),
     );
   };
   connectProjection();
   const treeRegistration = vscode.window.registerTreeDataProvider("piSelection.sessions", tree);
   const inlayRegistration = vscode.languages.registerInlayHintsProvider({ scheme: "file" }, inlays);
+  const projectionContentRegistration = vscode.workspace.registerTextDocumentContentProvider(
+    PROJECTION_SCHEME,
+    projectionContent,
+  );
 
   const coordinatorFor = (folder: vscode.WorkspaceFolder): PiCoordinator => {
     const cwd = folder.uri.fsPath;
@@ -232,8 +378,10 @@ export function activate(context: vscode.ExtensionContext): void {
     output,
     inlays,
     projection,
+    projectionContent,
     treeRegistration,
     inlayRegistration,
+    projectionContentRegistration,
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("piSelection.agentationServerUrl")) connectProjection();
     }),
@@ -294,6 +442,37 @@ export function activate(context: vscode.ExtensionContext): void {
       "piSelection.markReviewed",
       (thread: vscode.CommentThread) => projection.markReviewed(thread),
     ),
+    vscode.commands.registerCommand("piSelection.reviewChanges", async (target: unknown) => {
+      const snapshot = projection.snapshotFor(target);
+      if (!snapshot?.changes?.length) {
+        void vscode.window.showInformationMessage("This task has no projected changes.");
+        return;
+      }
+      const change =
+        snapshot.changes.length === 1
+          ? snapshot.changes[0]
+          : (
+              await vscode.window.showQuickPick(
+                snapshot.changes.map((candidate) => ({
+                  label: candidate.path,
+                  change: candidate,
+                })),
+                { title: "Review projected changes", placeHolder: "Select a changed file" },
+              )
+            )?.change;
+      if (!change) return;
+      try {
+        const { before, after } = await projectionContent.load(snapshot, change);
+        await vscode.commands.executeCommand(
+          "vscode.diff",
+          before,
+          after,
+          `${change.path} (Before ↔ After)`,
+        );
+      } catch (error) {
+        void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+      }
+    }),
     vscode.commands.registerCommand("piSelection.abort", async (job: PiJob) => {
       const coordinator = [...coordinators.values()].find((candidate) => candidate.list().includes(job));
       await coordinator?.abort(job);

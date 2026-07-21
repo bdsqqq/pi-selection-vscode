@@ -2,10 +2,14 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bdsqqq/pi-selection-vscode.git"
+  },
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -15,6 +19,7 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:piSelection.submit",
+    "onCommand:piSelection.reviewChanges",
     "onView:piSelection.sessions"
   ],
   "main": "./out/extension.js",
@@ -44,6 +49,11 @@
         "command": "piSelection.markReviewed",
         "title": "Mark Reviewed",
         "icon": "$(check)"
+      },
+      {
+        "command": "piSelection.reviewChanges",
+        "title": "Review Changes",
+        "icon": "$(diff)"
       }
     ],
     "keybindings": [
@@ -89,9 +99,14 @@
       ],
       "comments/commentThread/title": [
         {
+          "command": "piSelection.reviewChanges",
+          "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
+          "group": "inline@1"
+        },
+        {
           "command": "piSelection.markReviewed",
           "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
-          "group": "inline"
+          "group": "inline@2"
         }
       ]
     },
