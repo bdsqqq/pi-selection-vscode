@@ -539,6 +539,10 @@ export function activate(context: vscode.ExtensionContext): void {
         if (candidate === terminal) terminals.delete(sessionFile);
       }
     }),
+    vscode.commands.registerCommand("piSelection.navigateLeft", () => navigateWorkbench("left")),
+    vscode.commands.registerCommand("piSelection.navigateDown", () => navigateWorkbench("down")),
+    vscode.commands.registerCommand("piSelection.navigateUp", () => navigateWorkbench("up")),
+    vscode.commands.registerCommand("piSelection.navigateRight", () => navigateWorkbench("right")),
     vscode.commands.registerCommand("piSelection.submit", async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor || editor.selection.isEmpty) {
@@ -715,6 +719,27 @@ export function activate(context: vscode.ExtensionContext): void {
       },
     },
   );
+}
+
+type WorkbenchDirection = "left" | "down" | "up" | "right";
+
+async function navigateWorkbench(direction: WorkbenchDirection): Promise<void> {
+  const before = vscode.window.tabGroups.activeTabGroup.viewColumn;
+  await vscode.commands.executeCommand(`workbench.action.navigate${capitalize(direction)}`);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (vscode.window.tabGroups.activeTabGroup.viewColumn !== before) return;
+
+  const edgeFocusCommand = {
+    left: "workbench.action.focusAuxiliaryBar",
+    down: "workbench.action.focusPanel",
+    up: undefined,
+    right: "workbench.action.focusSideBar",
+  }[direction];
+  if (edgeFocusCommand) await vscode.commands.executeCommand(edgeFocusCommand);
+}
+
+function capitalize(value: string): string {
+  return `${value[0].toUpperCase()}${value.slice(1)}`;
 }
 
 export function deactivate(): void {}
