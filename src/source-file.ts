@@ -68,6 +68,23 @@ export function chooseSourcePath(
   return suffixMatches.length === 1 ? suffixMatches[0] : undefined;
 }
 
+export function exactReviewPath(cwd: string, changePath: string): string | undefined {
+  if (!changePath || path.isAbsolute(changePath)) return undefined;
+  const candidate = path.resolve(cwd, changePath);
+  return isPathWithinRoot(cwd, candidate) && candidate !== path.resolve(cwd) ? candidate : undefined;
+}
+
+export function isExactReviewPathContained(
+  cwdReal: string,
+  candidateReal: string,
+  workspaceRootsReal: readonly string[],
+): boolean {
+  return (
+    workspaceRootsReal.some((root) => isPathWithinRoot(root, cwdReal)) &&
+    isPathWithinRoot(cwdReal, candidateReal)
+  );
+}
+
 export function isPathWithinRoot(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));

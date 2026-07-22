@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chooseSourcePath, isPathWithinRoot, parseSourceFile } from "./source-file";
+import {
+  chooseSourcePath,
+  exactReviewPath,
+  isExactReviewPathContained,
+  isPathWithinRoot,
+  parseSourceFile,
+} from "./source-file";
 
 test("parseSourceFile reads locations from the right and decodes file URLs", () => {
   assert.deepEqual(parseSourceFile("src/button.tsx:42:7"), {
@@ -31,6 +37,32 @@ test("chooseSourcePath resolves exact and unique suffix paths inside cwd", () =>
   assert.equal(
     chooseSourcePath("src/card.tsx", "/work/app", candidates),
     "/work/app/packages/card/src/card.tsx",
+  );
+});
+
+test("exact review paths use cwd-relative identity without suffix guessing", () => {
+  assert.equal(exactReviewPath("/work/app", "src/button.tsx"), "/work/app/src/button.tsx");
+  assert.equal(exactReviewPath("/work/app", "../secret.ts"), undefined);
+  assert.equal(exactReviewPath("/work/app", "/work/app/src/button.tsx"), undefined);
+  assert.equal(exactReviewPath("/work/app", ""), undefined);
+});
+
+test("exact review path containment requires workspace and symlink boundaries", () => {
+  assert.equal(
+    isExactReviewPathContained(
+      "/work/app",
+      "/work/app/src/button.tsx",
+      ["/work"],
+    ),
+    true,
+  );
+  assert.equal(
+    isExactReviewPathContained("/work/app", "/private/secret.ts", ["/work"]),
+    false,
+  );
+  assert.equal(
+    isExactReviewPathContained("/work/app", "/work/app/src/button.tsx", ["/other"]),
+    false,
   );
 });
 

@@ -72,6 +72,10 @@ export class ProjectionController implements vscode.Disposable {
     return [...this.tasks.values()].map(({ job }) => job);
   }
 
+  snapshotByTaskId(taskId: string): AgentationSnapshot | undefined {
+    return this.tasks.get(taskId)?.state.snapshot;
+  }
+
   snapshotFor(target: unknown): AgentationSnapshot | undefined {
     const threadReview = this.reviews.get(target as vscode.CommentThread);
     if (threadReview) return this.tasks.get(threadReview.taskId)?.state.snapshot;

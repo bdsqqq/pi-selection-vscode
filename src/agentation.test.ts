@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   parseAgentationEvent,
+  parseProjectionRejectionPreparation,
+  ProjectionRejectionError,
   projectSnapshot,
   projectionContentUrl,
+  projectionRejectionAckRequest,
+  projectionRejectionPrepareRequest,
   SseParser,
   type AgentationSnapshot,
 } from "./agentation";
@@ -83,16 +87,70 @@ test("task snapshots parse changed paths strictly", () => {
 test("projectionContentUrl encodes task, path, and side without an Origin parameter", () => {
   const url = projectionContentUrl(
     "http://127.0.0.1:4748/base",
+    "generation-1",
     "task & one",
     "src/a file.ts",
     "before",
   );
   assert.equal(url.origin, "http://127.0.0.1:4748");
   assert.equal(url.pathname, "/projection-content");
+  assert.equal(url.searchParams.get("generation"), "generation-1");
   assert.equal(url.searchParams.get("taskId"), "task & one");
   assert.equal(url.searchParams.get("path"), "src/a file.ts");
   assert.equal(url.searchParams.get("side"), "before");
   assert.equal(url.searchParams.has("origin"), false);
+});
+
+test("projection rejection prepare and ack build generation-bound JSON posts", () => {
+  const prepared = projectionRejectionPrepareRequest(
+    "http://127.0.0.1:4748/base",
+    "generation-1",
+    "task & one",
+    "src/a file.ts",
+    "request-1",
+  );
+  assert.equal(prepared.url.toString(), "http://127.0.0.1:4748/projection-rejections/prepare");
+  assert.equal(prepared.init.method, "POST");
+  assert.deepEqual(prepared.init.headers, { "content-type": "application/json" });
+  assert.equal(
+    prepared.init.body,
+    JSON.stringify({
+      generation: "generation-1",
+      taskId: "task & one",
+      path: "src/a file.ts",
+      requestId: "request-1",
+    }),
+  );
+
+  const ack = projectionRejectionAckRequest(
+    "http://127.0.0.1:4748/base",
+    "generation-1",
+    "operation-1",
+  );
+  assert.equal(ack.url.toString(), "http://127.0.0.1:4748/projection-rejections/ack");
+  assert.equal(
+    ack.init.body,
+    JSON.stringify({ generation: "generation-1", operationId: "operation-1" }),
+  );
+  assert.equal(JSON.stringify([prepared.init, ack.init]).includes("origin"), false);
+});
+
+test("projection rejection preparation responses parse strictly", () => {
+  const preparation = { operationId: "operation-1", beforeExists: true, afterExists: true };
+  assert.deepEqual(parseProjectionRejectionPreparation(preparation), preparation);
+  assert.throws(() => parseProjectionRejectionPreparation({ ...preparation, extra: true }));
+  assert.throws(() =>
+    parseProjectionRejectionPreparation({ ...preparation, operationId: "" }),
+  );
+});
+
+test("projection rejection errors distinguish stale and unavailable requests", () => {
+  assert.match(new ProjectionRejectionError("prepare", 409).message, /review expired/);
+  assert.match(new ProjectionRejectionError("ack", 404).message, /ack is unavailable \(HTTP 404\)/);
+  assert.equal(
+    new ProjectionRejectionError("prepare", 204).message,
+    "Agentation projection rejection prepare returned HTTP 204.",
+  );
 });
 
 test("projectSnapshot replaces feed state idempotently and rejects regressions", () => {

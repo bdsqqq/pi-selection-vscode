@@ -43,6 +43,12 @@ export type SnapshotProjectionState = {
   feed: string[];
 };
 
+export type ProjectionRejectionPreparation = {
+  operationId: string;
+  beforeExists: boolean;
+  afterExists: boolean;
+};
+
 export function projectSnapshot(
   previous: SnapshotProjectionState | undefined,
   snapshot: AgentationSnapshot,
@@ -159,18 +165,59 @@ export class AgentationProjectionClient {
   }
 
   async fetchProjectionContent(
+    generation: string,
     taskId: string,
     changePath: string,
     side: "before" | "after",
   ): Promise<string> {
-    const response = await fetch(projectionContentUrl(this.serverUrl, taskId, changePath, side), {
-      headers: { accept: "text/plain" },
-      signal: this.controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`agentation projection content returned HTTP ${response.status}`);
+    const response = await fetch(
+      projectionContentUrl(this.serverUrl, generation, taskId, changePath, side),
+      {
+        headers: { accept: "text/plain" },
+        signal: this.controller.signal,
+      },
+    );
+    if (response.status !== 200) {
+      throw projectionRequestError("content", response.status);
     }
     return response.text();
+  }
+
+  async prepareProjectionRejection(
+    generation: string,
+    taskId: string,
+    changePath: string,
+    requestId: string,
+  ): Promise<ProjectionRejectionPreparation> {
+    const { url, init } = projectionRejectionPrepareRequest(
+      this.serverUrl,
+      generation,
+      taskId,
+      changePath,
+      requestId,
+    );
+    const response = await fetch(url, { ...init, signal: this.controller.signal });
+    if (response.status !== 200) throw projectionRequestError("prepare", response.status);
+    return parseProjectionRejectionPreparation(await response.json());
+  }
+
+  async acknowledgeProjectionRejection(generation: string, operationId: string): Promise<void> {
+    const { url, init } = projectionRejectionAckRequest(
+      this.serverUrl,
+      generation,
+      operationId,
+    );
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetch(url, { ...init, signal: this.controller.signal });
+        if (response.status !== 200) throw projectionRequestError("ack", response.status);
+        return;
+      } catch (error) {
+        if (attempt === 1 || error instanceof ProjectionRejectionError || this.controller.signal.aborted) {
+          throw error;
+        }
+      }
+    }
   }
 
   private delay(ms: number): Promise<void> {
@@ -206,15 +253,95 @@ function ensureTrailingSlash(value: string): string {
 
 export function projectionContentUrl(
   serverUrl: string,
+  generation: string,
   taskId: string,
   changePath: string,
   side: "before" | "after",
 ): URL {
   const endpoint = new URL("/projection-content", ensureTrailingSlash(serverUrl));
+  endpoint.searchParams.set("generation", generation);
   endpoint.searchParams.set("taskId", taskId);
   endpoint.searchParams.set("path", changePath);
   endpoint.searchParams.set("side", side);
   return endpoint;
+}
+
+export function projectionRejectionPrepareRequest(
+  serverUrl: string,
+  generation: string,
+  taskId: string,
+  changePath: string,
+  requestId: string,
+): { url: URL; init: RequestInit } {
+  return jsonPostRequest(serverUrl, "/projection-rejections/prepare", {
+    generation,
+    taskId,
+    path: changePath,
+    requestId,
+  });
+}
+
+export function projectionRejectionAckRequest(
+  serverUrl: string,
+  generation: string,
+  operationId: string,
+): { url: URL; init: RequestInit } {
+  return jsonPostRequest(serverUrl, "/projection-rejections/ack", { generation, operationId });
+}
+
+export class ProjectionRejectionError extends Error {
+  constructor(
+    readonly phase: "content" | "prepare" | "ack",
+    readonly status: number,
+  ) {
+    super(
+      status === 409 || status === 410
+        ? "This review expired because the server projection generation changed. Reopen Review Changes and try again."
+        : status === 404
+          ? `Agentation projection rejection ${phase} is unavailable (HTTP 404).`
+          : `Agentation projection rejection ${phase} returned HTTP ${status}.`,
+    );
+    this.name = "ProjectionRejectionError";
+  }
+}
+
+export function parseProjectionRejectionPreparation(
+  value: unknown,
+): ProjectionRejectionPreparation {
+  if (!value || typeof value !== "object") throw new Error("invalid rejection preparation response");
+  const preparation = value as Partial<ProjectionRejectionPreparation>;
+  if (
+    Object.keys(preparation).length !== 3 ||
+    typeof preparation.operationId !== "string" ||
+    preparation.operationId.length === 0 ||
+    typeof preparation.beforeExists !== "boolean" ||
+    typeof preparation.afterExists !== "boolean"
+  ) {
+    throw new Error("invalid rejection preparation response");
+  }
+  return preparation as ProjectionRejectionPreparation;
+}
+
+function projectionRequestError(
+  phase: "content" | "prepare" | "ack",
+  status: number,
+): ProjectionRejectionError {
+  return new ProjectionRejectionError(phase, status);
+}
+
+function jsonPostRequest(
+  serverUrl: string,
+  pathname: string,
+  body: Record<string, string>,
+): { url: URL; init: RequestInit } {
+  return {
+    url: new URL(pathname, ensureTrailingSlash(serverUrl)),
+    init: {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  };
 }
 
 export function parseAgentationEvent(record: string): AgentationEvent {

@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -20,6 +20,7 @@
     "onStartupFinished",
     "onCommand:piSelection.submit",
     "onCommand:piSelection.reviewChanges",
+    "onCommand:piSelection.rejectChange",
     "onView:piSelection.sessions"
   ],
   "main": "./out/extension.js",
@@ -54,6 +55,12 @@
         "command": "piSelection.reviewChanges",
         "title": "Review Changes",
         "icon": "$(diff)"
+      },
+      {
+        "command": "piSelection.rejectChange",
+        "title": "Pi Selection: Reject This File",
+        "icon": "$(trash)",
+        "enablement": "resourceScheme == pi-selection-review"
       }
     ],
     "keybindings": [
@@ -107,6 +114,13 @@
           "command": "piSelection.markReviewed",
           "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
           "group": "inline@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "piSelection.rejectChange",
+          "when": "resourceScheme == pi-selection-review",
+          "group": "navigation@10"
         }
       ]
     },

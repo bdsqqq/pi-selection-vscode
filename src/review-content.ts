@@ -15,6 +15,33 @@ export type ProjectionContentTarget = {
   side: ProjectionSide;
 };
 
+export type RejectionStateDecision =
+  | "already-restored"
+  | "replace-with-before"
+  | "unsupported-created-file"
+  | "conflict";
+
+export function decideRejectionState(input: {
+  beforeExists: boolean;
+  currentExists: boolean;
+  dirty: boolean;
+  currentText?: string;
+  beforeText?: string;
+  afterText?: string;
+}): RejectionStateDecision {
+  if (!input.beforeExists) return "unsupported-created-file";
+  if (
+    !input.currentExists ||
+    typeof input.currentText !== "string" ||
+    typeof input.beforeText !== "string" ||
+    typeof input.afterText !== "string"
+  ) {
+    return "conflict";
+  }
+  if (input.currentText === input.beforeText) return "already-restored";
+  return input.currentText === input.afterText ? "replace-with-before" : "conflict";
+}
+
 export function projectionUriParts(
   generation: string,
   taskId: string,
@@ -70,6 +97,23 @@ export class ProjectionUriRegistry<T extends ProjectionUriParts> {
     const removed: Array<[string, T]> = [];
     for (const [key, uri] of this.uris) {
       if (parseProjectionUri(uri)?.taskId !== taskId) continue;
+      this.uris.delete(key);
+      removed.push([key, uri]);
+    }
+    return removed;
+  }
+
+  removeChange(generation: string, taskId: string, changePath: string): Array<[string, T]> {
+    const removed: Array<[string, T]> = [];
+    for (const [key, uri] of this.uris) {
+      const target = parseProjectionUri(uri);
+      if (
+        target?.generation !== generation ||
+        target.taskId !== taskId ||
+        target.path !== changePath
+      ) {
+        continue;
+      }
       this.uris.delete(key);
       removed.push([key, uri]);
     }

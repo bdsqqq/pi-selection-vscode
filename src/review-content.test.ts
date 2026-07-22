@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  decideRejectionState,
   parseProjectionUri,
   projectionUriParts,
   ProjectionUriRegistry,
@@ -36,6 +37,80 @@ test("ProjectionUriRegistry returns every loaded URI on reset", () => {
   assert.deepEqual(registry.removeTask("task-1"), [["first", first]]);
   assert.deepEqual(registry.reset(), [second]);
   assert.equal(registry.size, 0);
+});
+
+test("ProjectionUriRegistry removes both sides of one generation's changed path", () => {
+  const registry = new ProjectionUriRegistry();
+  const before = projectionUriParts("generation-1", "task-1", "src/a.ts", "before");
+  const after = projectionUriParts("generation-1", "task-1", "src/a.ts", "after");
+  const otherPath = projectionUriParts("generation-1", "task-1", "src/b.ts", "after");
+  const newer = projectionUriParts("generation-2", "task-1", "src/a.ts", "before");
+  registry.remember("before", before);
+  registry.remember("after", after);
+  registry.remember("otherPath", otherPath);
+  registry.remember("newer", newer);
+
+  assert.deepEqual(registry.removeChange("generation-1", "task-1", "src/a.ts"), [
+    ["before", before],
+    ["after", after],
+  ]);
+  assert.deepEqual(registry.reset(), [otherPath, newer]);
+});
+
+test("rejection state decisions reject mismatches and treat created files as unsupported", () => {
+  assert.equal(
+    decideRejectionState({
+      beforeExists: true,
+      currentExists: true,
+      dirty: true,
+      currentText: "concurrent",
+      beforeText: "before",
+      afterText: "after",
+    }),
+    "conflict",
+  );
+  assert.equal(
+    decideRejectionState({
+      beforeExists: true,
+      currentExists: true,
+      dirty: true,
+      currentText: "before",
+      beforeText: "before",
+      afterText: "after",
+    }),
+    "already-restored",
+  );
+  assert.equal(
+    decideRejectionState({
+      beforeExists: true,
+      currentExists: true,
+      dirty: true,
+      currentText: "after",
+      beforeText: "before",
+      afterText: "after",
+    }),
+    "replace-with-before",
+  );
+  for (const dirty of [false, true]) {
+    assert.equal(
+      decideRejectionState({
+        beforeExists: false,
+        currentExists: true,
+        dirty,
+        currentText: "after",
+        afterText: "after",
+      }),
+      "unsupported-created-file",
+    );
+  }
+  assert.equal(
+    decideRejectionState({
+      beforeExists: false,
+      currentExists: false,
+      dirty: false,
+    }),
+    "unsupported-created-file",
+  );
 });
 
 test("Utf8LruCache enforces UTF-8 byte and document budgets", () => {

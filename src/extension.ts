@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -9,6 +11,7 @@ import { BufferBridge } from "./bridge";
 import { PiCoordinator, type PiJob, type SelectionRequest } from "./coordinator";
 import { ProjectionController } from "./projection";
 import {
+  decideRejectionState,
   parseProjectionUri,
   PROJECTION_SCHEME,
   projectionUriParts,
@@ -16,6 +19,7 @@ import {
   Utf8LruCache,
 } from "./review-content";
 import { SessionInlays } from "./session-inlays";
+import { exactReviewPath, isExactReviewPathContained } from "./source-file";
 import { PI_SELECTION_SYSTEM_PROMPT } from "./system-prompt";
 
 class SessionTree implements vscode.TreeDataProvider<PiJob> {
@@ -100,6 +104,19 @@ class ProjectionContentProvider implements vscode.TextDocumentContentProvider, v
     return this.fetch(uri, false);
   }
 
+  targetFor(uri: vscode.Uri): NonNullable<ReturnType<typeof parseProjectionUri>> {
+    const target = parseProjectionUri(uri);
+    if (!target) throw new Error("Open a projected review file before rejecting changes.");
+    this.assertGeneration(target.generation);
+    return target;
+  }
+
+  assertGeneration(generation: string): void {
+    if (generation !== this.generation) {
+      throw new Error("This review expired when the server projection reset. Reopen Review Changes and try again.");
+    }
+  }
+
   async load(
     snapshot: AgentationSnapshot,
     change: AgentationChange,
@@ -129,13 +146,11 @@ class ProjectionContentProvider implements vscode.TextDocumentContentProvider, v
   }
 
   removeTask(taskId: string): void {
-    for (const [key, uri] of this.loadedUris.removeTask(taskId)) {
-      this.contents.delete(key);
-      this.pending.delete(key);
-      this.expiredUris.add(key);
-      this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
-      this.changed.fire(uri);
-    }
+    this.invalidate(this.loadedUris.removeTask(taskId));
+  }
+
+  removeChange(generation: string, taskId: string, changePath: string): void {
+    this.invalidate(this.loadedUris.removeChange(generation, taskId, changePath));
   }
 
   dispose(): void {
@@ -146,6 +161,16 @@ class ProjectionContentProvider implements vscode.TextDocumentContentProvider, v
     this.expiredUris.clear();
     this.keyEpochs.clear();
     this.changed.dispose();
+  }
+
+  private invalidate(entries: Array<[string, vscode.Uri]>): void {
+    for (const [key, uri] of entries) {
+      this.contents.delete(key);
+      this.pending.delete(key);
+      this.expiredUris.add(key);
+      this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
+      this.changed.fire(uri);
+    }
   }
 
   private async fetch(uri: vscode.Uri, refresh: boolean): Promise<string> {
@@ -166,7 +191,12 @@ class ProjectionContentProvider implements vscode.TextDocumentContentProvider, v
     const epoch = this.epoch;
     const keyEpoch = this.keyEpochs.get(key) ?? 0;
     const request = (async () => {
-      const content = await client.fetchProjectionContent(target.taskId, target.path, target.side);
+      const content = await client.fetchProjectionContent(
+        target.generation,
+        target.taskId,
+        target.path,
+        target.side,
+      );
       if (this.epoch !== epoch) throw new Error("This review expired when the server projection reset.");
       if ((this.keyEpochs.get(key) ?? 0) !== keyEpoch) {
         throw new Error("This review task was removed.");
@@ -182,6 +212,121 @@ class ProjectionContentProvider implements vscode.TextDocumentContentProvider, v
       if (this.pending.get(key) === request) this.pending.delete(key);
     }
   }
+}
+
+async function resolveExactReviewChangePath(
+  snapshot: AgentationSnapshot,
+  changePath: string,
+): Promise<string> {
+  const candidate = exactReviewPath(snapshot.cwd, changePath);
+  if (!candidate) throw new Error("The projected change path is not a relative path inside its task cwd.");
+
+  const cwdReal = await realpath(snapshot.cwd);
+  const workspaceRootsReal = (
+    await Promise.all(
+      (vscode.workspace.workspaceFolders ?? []).map(async (folder) => {
+        try {
+          return await realpath(folder.uri.fsPath);
+        } catch {
+          return undefined;
+        }
+      }),
+    )
+  ).filter((root): root is string => root !== undefined);
+  const candidateReal = await realpathBoundary(candidate);
+  if (!isExactReviewPathContained(cwdReal, candidateReal, workspaceRootsReal)) {
+    throw new Error("The projected change path escapes its task cwd or open workspace.");
+  }
+  return candidate;
+}
+
+async function realpathBoundary(candidate: string): Promise<string> {
+  try {
+    return await realpath(candidate);
+  } catch (error) {
+    if (!isFileNotFound(error)) throw error;
+    return realpath(path.dirname(candidate));
+  }
+}
+
+async function localFileExists(candidate: string): Promise<boolean> {
+  try {
+    await stat(candidate);
+    return true;
+  } catch (error) {
+    if (isFileNotFound(error)) return false;
+    throw error;
+  }
+}
+
+function isFileNotFound(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+
+function rejectionConflict(message: string): Error {
+  return new Error(`${message} No changes were acknowledged; newer local state was preserved.`);
+}
+
+async function applyPreparedRejection(
+  client: AgentationProjectionClient,
+  projectionContent: ProjectionContentProvider,
+  target: NonNullable<ReturnType<typeof parseProjectionUri>>,
+  preparation: Awaited<ReturnType<AgentationProjectionClient["prepareProjectionRejection"]>>,
+  filePath: string,
+): Promise<void> {
+  if (!preparation.beforeExists) {
+    throw new Error("Automatic rejection cannot safely delete a task-created file.");
+  }
+  if (!preparation.afterExists) {
+    throw rejectionConflict("This task deleted the file, which cannot be rejected by this editor flow.");
+  }
+
+  const uri = vscode.Uri.file(filePath);
+  const [beforeText, afterText] = await Promise.all([
+    client.fetchProjectionContent(target.generation, target.taskId, target.path, "before"),
+    client.fetchProjectionContent(target.generation, target.taskId, target.path, "after"),
+  ]);
+  if (!(await localFileExists(filePath))) {
+    throw rejectionConflict("The local file no longer exists.");
+  }
+  const document = await vscode.workspace.openTextDocument(uri);
+  const decision = decideRejectionState({
+    beforeExists: true,
+    currentExists: true,
+    dirty: document.isDirty,
+    currentText: document.getText(),
+    beforeText,
+    afterText,
+  });
+  if (decision === "conflict") {
+    throw rejectionConflict("The local file no longer exactly matches the prepared change.");
+  }
+  if (decision === "replace-with-before") {
+    projectionContent.assertGeneration(target.generation);
+    if (document.getText() !== afterText) {
+      throw rejectionConflict("The local file changed immediately before rejection.");
+    }
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), beforeText);
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      throw rejectionConflict("VS Code refused the rejection edit.");
+    }
+  }
+  if (document.getText() !== beforeText) {
+    throw rejectionConflict("The local file did not reach the verified before state.");
+  }
+}
+
+async function closeActiveReviewDiff(uri: vscode.Uri): Promise<void> {
+  const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  if (!(tab?.input instanceof vscode.TabInputTextDiff)) return;
+  if (
+    tab.input.original.toString() !== uri.toString() &&
+    tab.input.modified.toString() !== uri.toString()
+  ) {
+    return;
+  }
+  await vscode.window.tabGroups.close(tab);
 }
 
 function refreshFeed(job: PiJob, quickPick: vscode.QuickPick<vscode.QuickPickItem>): void {
@@ -469,6 +614,49 @@ export function activate(context: vscode.ExtensionContext): void {
           after,
           `${change.path} (Before ↔ After)`,
         );
+      } catch (error) {
+        void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+      }
+    }),
+    vscode.commands.registerCommand("piSelection.rejectChange", async () => {
+      const uri = vscode.window.activeTextEditor?.document.uri;
+      if (!uri) return;
+      try {
+        const target = projectionContent.targetFor(uri);
+        const snapshot = projection.snapshotByTaskId(target.taskId);
+        if (!snapshot?.changes?.some((change) => change.path === target.path)) {
+          throw new Error("This projected change is no longer available. Reopen Review Changes and try again.");
+        }
+        const confirmed = await vscode.window.showWarningMessage(
+          `Reject projected changes to ${target.path}?`,
+          {
+            modal: true,
+            detail: "The editor will restore the exact projected before state as one undoable workspace edit.",
+          },
+          "Reject This File",
+        );
+        if (confirmed !== "Reject This File") return;
+        const client = projectionClient;
+        if (!client) throw new Error("Agentation projection client is not connected.");
+
+        projectionContent.assertGeneration(target.generation);
+        const preparation = await client.prepareProjectionRejection(
+          target.generation,
+          target.taskId,
+          target.path,
+          randomUUID(),
+        );
+        if (!preparation.beforeExists) {
+          void vscode.window.showWarningMessage(
+            `Automatic rejection cannot safely delete the task-created file ${target.path} because VS Code has no version-guarded delete. Delete it manually, then Mark Reviewed.`,
+          );
+          return;
+        }
+        const filePath = await resolveExactReviewChangePath(snapshot, target.path);
+        await applyPreparedRejection(client, projectionContent, target, preparation, filePath);
+        await client.acknowledgeProjectionRejection(target.generation, preparation.operationId);
+        projectionContent.removeChange(target.generation, target.taskId, target.path);
+        await closeActiveReviewDiff(uri);
       } catch (error) {
         void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
       }
