@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",

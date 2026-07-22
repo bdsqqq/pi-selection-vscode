@@ -3,6 +3,7 @@ import test from "node:test";
 import type { SelectionRequest } from "./coordinator";
 import {
   isSelectionReplyable,
+  preferredSelectionStatus,
   selectionDecorationStatus,
   selectionThreadItems,
   transformSelectionOffsets,
@@ -54,6 +55,14 @@ test("aborted jobs use the packaged failure status decoration", () => {
   assert.equal(selectionDecorationStatus("aborted"), "failed");
   assert.equal(selectionDecorationStatus("completed"), "completed");
   assert.equal(selectionDecorationStatus("running"), "running");
+});
+
+test("one gutter line prefers active work over terminal status", () => {
+  assert.equal(preferredSelectionStatus(undefined, "completed"), "completed");
+  assert.equal(preferredSelectionStatus("completed", "failed"), "failed");
+  assert.equal(preferredSelectionStatus("failed", "queued"), "queued");
+  assert.equal(preferredSelectionStatus("queued", "running"), "running");
+  assert.equal(preferredSelectionStatus("running", "completed"), "running");
 });
 
 test("selection offsets follow edits without absorbing boundary insertions", () => {

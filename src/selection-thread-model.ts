@@ -38,10 +38,26 @@ export function isSelectionReplyable(job: {
   );
 }
 
-export function selectionDecorationStatus(
-  status: JobStatus,
-): "queued" | "running" | "completed" | "failed" {
+export type SelectionDecorationStatus = "queued" | "running" | "completed" | "failed";
+
+export function selectionDecorationStatus(status: JobStatus): SelectionDecorationStatus {
   return status === "aborted" ? "failed" : status;
+}
+
+const STATUS_PRIORITY: Record<SelectionDecorationStatus, number> = {
+  completed: 0,
+  failed: 1,
+  queued: 2,
+  running: 3,
+};
+
+export function preferredSelectionStatus(
+  current: SelectionDecorationStatus | undefined,
+  candidate: SelectionDecorationStatus,
+): SelectionDecorationStatus {
+  return current === undefined || STATUS_PRIORITY[candidate] > STATUS_PRIORITY[current]
+    ? candidate
+    : current;
 }
 
 export function transformSelectionOffsets(

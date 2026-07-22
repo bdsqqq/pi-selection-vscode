@@ -20,7 +20,7 @@ Selection sessions and projected browser sessions share presentation primitives 
 
 ## Use
 
-1. Install `pi-selection-0.6.0.vsix` with **Extensions: Install from VSIX…**.
+1. Install `pi-selection-0.6.1.vsix` with **Extensions: Install from VSIX…**.
 2. Open a trusted folder where `pi` already works.
 3. Select code and press `Cmd+I` (`Ctrl+I` elsewhere).
 4. Enter an instruction. A folded native comment thread and gutter status badge anchor to the selected range while Pi works.

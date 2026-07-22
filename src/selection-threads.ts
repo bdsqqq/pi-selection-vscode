@@ -16,6 +16,7 @@ import {
 } from "./selection-thread-persistence";
 import {
   isSelectionReplyable,
+  preferredSelectionStatus,
   selectionDecorationStatus,
   selectionThreadItems,
   transformSelectionOffsets,
@@ -377,18 +378,26 @@ export class SelectionThreads implements vscode.Disposable {
         completed: [],
         failed: [],
       };
+      const byLine = new Map<
+        number,
+        { position: vscode.Position; status: keyof typeof byStatus }
+      >();
       for (const selection of this.selections.values()) {
-        if (selection.uri !== editor.document.uri.toString()) continue;
-        const range = rangeAtOffsets(
+        if (selection.uri !== editor.document.uri.toString() || selection.reviewed) continue;
+        const position = rangeAtOffsets(
           editor.document,
           selection.startOffset,
           selection.endOffset,
-        );
-        if (!selection.reviewed) {
-          byStatus[selectionDecorationStatus(selection.job.status)].push(
-            new vscode.Range(range.start, range.start),
-          );
-        }
+        ).start;
+        const candidate = selectionDecorationStatus(selection.job.status);
+        const current = byLine.get(position.line);
+        byLine.set(position.line, {
+          position,
+          status: preferredSelectionStatus(current?.status, candidate),
+        });
+      }
+      for (const { position, status } of byLine.values()) {
+        byStatus[status].push(new vscode.Range(position, position));
       }
       for (const status of ["queued", "running", "completed", "failed"] as const) {
         editor.setDecorations(this.gutterDecorations[status], byStatus[status]);
