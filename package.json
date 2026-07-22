@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.5.0",
+  "version": "0.4.1",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -19,10 +19,6 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:piSelection.submit",
-    "onCommand:piSelection.navigateLeft",
-    "onCommand:piSelection.navigateDown",
-    "onCommand:piSelection.navigateUp",
-    "onCommand:piSelection.navigateRight",
     "onCommand:piSelection.reply",
     "onCommand:piSelection.reviewChanges",
     "onCommand:piSelection.rejectChange",
@@ -34,22 +30,6 @@
       {
         "command": "piSelection.submit",
         "title": "Pi: Prompt About Selection"
-      },
-      {
-        "command": "piSelection.navigateLeft",
-        "title": "Pi Selection: Navigate Left or Reveal Left Sidebar"
-      },
-      {
-        "command": "piSelection.navigateDown",
-        "title": "Pi Selection: Navigate Down or Reveal Panel"
-      },
-      {
-        "command": "piSelection.navigateUp",
-        "title": "Pi Selection: Navigate Up"
-      },
-      {
-        "command": "piSelection.navigateRight",
-        "title": "Pi Selection: Navigate Right or Reveal Right Sidebar"
       },
       {
         "command": "piSelection.openSession",
