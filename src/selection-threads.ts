@@ -24,12 +24,6 @@ export class SelectionThreads implements vscode.Disposable {
     "piSelection.selection",
     "Pi Selection Sessions",
   );
-  private readonly unresolvedDecoration = vscode.window.createTextEditorDecorationType({
-    isWholeLine: true,
-    backgroundColor: new vscode.ThemeColor("editor.wordHighlightBackground"),
-    overviewRulerColor: new vscode.ThemeColor("editorOverviewRuler.warningForeground"),
-    overviewRulerLane: vscode.OverviewRulerLane.Right,
-  });
   private readonly gutterDecorations: Record<
     "queued" | "running" | "completed" | "failed",
     vscode.TextEditorDecorationType
@@ -139,7 +133,6 @@ export class SelectionThreads implements vscode.Disposable {
     for (const selection of this.selections.values()) selection.thread.dispose();
     this.selections.clear();
     this.comments.dispose();
-    this.unresolvedDecoration.dispose();
     for (const decoration of Object.values(this.gutterDecorations)) decoration.dispose();
   }
 
@@ -162,7 +155,6 @@ export class SelectionThreads implements vscode.Disposable {
 
   private refreshDecorations(): void {
     for (const editor of vscode.window.visibleTextEditors) {
-      const unresolved: vscode.Range[] = [];
       const byStatus: Record<
         "queued" | "running" | "completed" | "failed",
         vscode.Range[]
@@ -179,10 +171,12 @@ export class SelectionThreads implements vscode.Disposable {
           selection.startOffset,
           selection.endOffset,
         );
-        byStatus[selectionDecorationStatus(selection.job.status)].push(range);
-        if (!selection.reviewed) unresolved.push(range);
+        if (!selection.reviewed) {
+          byStatus[selectionDecorationStatus(selection.job.status)].push(
+            new vscode.Range(range.start, range.start),
+          );
+        }
       }
-      editor.setDecorations(this.unresolvedDecoration, unresolved);
       for (const status of ["queued", "running", "completed", "failed"] as const) {
         editor.setDecorations(this.gutterDecorations[status], byStatus[status]);
       }
