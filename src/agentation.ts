@@ -12,12 +12,21 @@ export type AgentationChange = {
   path: string;
 };
 
+export type AgentationMessage = {
+  id: string;
+  annotationId?: string;
+  role: "user" | "assistant";
+  body: string;
+};
+
 export type AgentationSnapshot = {
   type: "task.snapshot";
   taskId: string;
   cwd: string;
   url?: string;
   annotations: AgentationAnnotation[];
+  revision: number;
+  messages?: AgentationMessage[];
   changes?: AgentationChange[];
   status: "queued" | "running" | "completed" | "failed";
   detail: string;
@@ -183,6 +192,31 @@ export class AgentationProjectionClient {
     return response.text();
   }
 
+  async postProjectionReply(
+    generation: string,
+    taskId: string,
+    annotationId: string,
+    text: string,
+    requestId: string,
+    validate?: () => void,
+  ): Promise<void> {
+    const { url, init } = projectionReplyRequest(
+      this.serverUrl,
+      generation,
+      taskId,
+      annotationId,
+      text,
+      requestId,
+    );
+    await sendProjectionReplyWithRetry(
+      fetch,
+      url,
+      init,
+      this.controller.signal,
+      validate,
+    );
+  }
+
   async prepareProjectionRejection(
     generation: string,
     taskId: string,
@@ -241,10 +275,7 @@ function isSnapshotRegression(
   previous: AgentationSnapshot,
   next: AgentationSnapshot,
 ): boolean {
-  if (previous.taskId !== next.taskId) return false;
-  if (["completed", "failed"].includes(previous.status) && previous.status !== next.status) return true;
-  const rank = { queued: 0, running: 1, completed: 2, failed: 2 } as const;
-  return rank[next.status] < rank[previous.status];
+  return previous.taskId === next.taskId && next.revision <= previous.revision;
 }
 
 function ensureTrailingSlash(value: string): string {
@@ -264,6 +295,68 @@ export function projectionContentUrl(
   endpoint.searchParams.set("path", changePath);
   endpoint.searchParams.set("side", side);
   return endpoint;
+}
+
+export function projectionReplyRequest(
+  serverUrl: string,
+  generation: string,
+  taskId: string,
+  annotationId: string,
+  text: string,
+  requestId: string,
+): { url: URL; init: RequestInit } {
+  return jsonPostRequest(serverUrl, "/projection-replies", {
+    generation,
+    taskId,
+    annotationId,
+    text,
+    requestId,
+  });
+}
+
+export class ProjectionReplyError extends Error {
+  constructor(readonly status: number) {
+    super(
+      status === 409
+        ? "Pi is busy with another reply. Wait for it to finish and try again."
+        : status === 410
+          ? "This reply expired because the server projection generation changed. Try again from the current comment thread."
+          : status === 404
+            ? "Replies are unavailable for this Agentation projection (HTTP 404)."
+            : `Agentation projection reply returned HTTP ${status}.`,
+    );
+    this.name = "ProjectionReplyError";
+  }
+}
+
+export function assertProjectionReplyResponse(status: number): void {
+  if (status !== 202) throw new ProjectionReplyError(status);
+}
+
+export type ProjectionReplyFetch = (
+  url: URL,
+  init: RequestInit,
+) => Promise<{ status: number }>;
+
+export async function sendProjectionReplyWithRetry(
+  fetchReply: ProjectionReplyFetch,
+  url: URL,
+  init: RequestInit,
+  signal: AbortSignal,
+  validate?: () => void,
+): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    validate?.();
+    let response: { status: number };
+    try {
+      response = await fetchReply(url, { ...init, signal });
+    } catch (error) {
+      if (attempt === 1 || signal.aborted) throw error;
+      continue;
+    }
+    assertProjectionReplyResponse(response.status);
+    return;
+  }
 }
 
 export function projectionRejectionPrepareRequest(
@@ -374,6 +467,19 @@ function isAgentationReset(value: unknown): value is AgentationReset {
   );
 }
 
+function isAgentationMessage(value: unknown): value is AgentationMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<AgentationMessage>;
+  const expectedKeys = message.annotationId === undefined ? 3 : 4;
+  return (
+    Object.keys(message).length === expectedKeys &&
+    typeof message.id === "string" &&
+    (message.annotationId === undefined || typeof message.annotationId === "string") &&
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.body === "string"
+  );
+}
+
 function isAgentationSnapshot(value: unknown): value is AgentationSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<AgentationSnapshot>;
@@ -390,6 +496,11 @@ function isAgentationSnapshot(value: unknown): value is AgentationSnapshot {
         typeof annotation.comment === "string" &&
         (annotation.reactComponents === undefined || typeof annotation.reactComponents === "string"),
     ) &&
+    Number.isSafeInteger(snapshot.revision) &&
+    (snapshot.revision ?? 0) > 0 &&
+    (snapshot.messages === undefined ||
+      (Array.isArray(snapshot.messages) &&
+        snapshot.messages.every(isAgentationMessage))) &&
     (snapshot.changes === undefined ||
       (Array.isArray(snapshot.changes) &&
         snapshot.changes.every(

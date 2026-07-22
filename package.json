@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -19,6 +19,7 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:piSelection.submit",
+    "onCommand:piSelection.reply",
     "onCommand:piSelection.reviewChanges",
     "onCommand:piSelection.rejectChange",
     "onView:piSelection.sessions"
@@ -45,6 +46,11 @@
       {
         "command": "piSelection.clearCompleted",
         "title": "Pi: Clear Finished Sessions"
+      },
+      {
+        "command": "piSelection.reply",
+        "title": "Reply",
+        "icon": "$(send)"
       },
       {
         "command": "piSelection.markReviewed",
@@ -102,6 +108,13 @@
           "command": "piSelection.abort",
           "when": "view == piSelection.sessions && viewItem == piSelection.running",
           "group": "inline@1"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "piSelection.reply",
+          "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
+          "group": "inline"
         }
       ],
       "comments/commentThread/title": [

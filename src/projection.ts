@@ -5,12 +5,14 @@ import {
   projectSnapshot,
   type AgentationAnnotation,
   type AgentationEvent,
+  type AgentationMessage,
   type AgentationSnapshot,
   type SnapshotProjectionState,
 } from "./agentation";
 import { transformAnchor } from "./anchor";
 import { jobName, type PiJob } from "./coordinator";
 import { latestUpdate } from "./inlay-text";
+import { projectThreadItems } from "./projection-comments";
 import { SessionInlays } from "./session-inlays";
 import {
   chooseSourcePath,
@@ -22,6 +24,7 @@ import {
 type ProjectedReview = {
   key: string;
   taskId: string;
+  annotationId: string;
   signature: string;
   job: PiJob;
   thread: vscode.CommentThread;
@@ -41,6 +44,12 @@ type ProjectedTask = {
   pendingAnchors: Map<string, symbol>;
 };
 
+export type ProjectionReplyTarget = {
+  generation: string;
+  taskId: string;
+  annotationId: string;
+};
+
 export class ProjectionController implements vscode.Disposable {
   private readonly comments = vscode.comments.createCommentController(
     "piSelection.agentation",
@@ -52,16 +61,29 @@ export class ProjectionController implements vscode.Disposable {
     overviewRulerColor: new vscode.ThemeColor("editorOverviewRuler.warningForeground"),
     overviewRulerLane: vscode.OverviewRulerLane.Right,
   });
+  readonly queuedGutterDecoration: vscode.TextEditorDecorationType;
+  readonly runningGutterDecoration: vscode.TextEditorDecorationType;
+  readonly completedGutterDecoration: vscode.TextEditorDecorationType;
+  readonly failedGutterDecoration: vscode.TextEditorDecorationType;
   private readonly tasks = new Map<string, ProjectedTask>();
   private readonly reviews = new Map<vscode.CommentThread, ProjectedReview>();
   private readonly disposables: vscode.Disposable[];
+  private generation?: string;
 
   constructor(
+    extensionUri: vscode.Uri,
     private readonly inlays: SessionInlays,
     private readonly onChange: () => void,
     private readonly log: (message: string) => void,
   ) {
-    this.comments.options = { prompt: "", placeHolder: "" };
+    this.comments.options = {
+      prompt: "Reply to this Pi session",
+      placeHolder: "Ask Pi to follow up…",
+    };
+    this.queuedGutterDecoration = createGutterDecoration(extensionUri, "queued");
+    this.runningGutterDecoration = createGutterDecoration(extensionUri, "running");
+    this.completedGutterDecoration = createGutterDecoration(extensionUri, "completed");
+    this.failedGutterDecoration = createGutterDecoration(extensionUri, "failed");
     this.disposables = [
       vscode.workspace.onDidChangeTextDocument((event) => this.trackDocumentEdit(event)),
       vscode.window.onDidChangeVisibleTextEditors(() => this.refreshDecorations()),
@@ -93,8 +115,29 @@ export class ProjectionController implements vscode.Disposable {
     return Boolean(this.snapshotFor(job)?.changes?.length);
   }
 
+  replyTarget(thread: vscode.CommentThread): ProjectionReplyTarget | undefined {
+    const review = this.reviews.get(thread);
+    if (!review || !this.generation) return undefined;
+    const snapshot = this.tasks.get(review.taskId)?.state.snapshot;
+    if (!snapshot || !isReplyable(snapshot)) return undefined;
+    return { generation: this.generation, taskId: review.taskId, annotationId: review.annotationId };
+  }
+
+  assertReplyTarget(thread: vscode.CommentThread, target: ProjectionReplyTarget): void {
+    const current = this.replyTarget(thread);
+    if (
+      !current ||
+      current.generation !== target.generation ||
+      current.taskId !== target.taskId ||
+      current.annotationId !== target.annotationId
+    ) {
+      throw new Error("This reply target expired. Try again from the current comment thread.");
+    }
+  }
+
   handle(event: AgentationEvent): void {
     if (event.type === "projection.reset") {
+      this.generation = event.generation;
       this.reset();
       return;
     }
@@ -149,6 +192,10 @@ export class ProjectionController implements vscode.Disposable {
     this.reviews.clear();
     this.comments.dispose();
     this.decoration.dispose();
+    this.queuedGutterDecoration.dispose();
+    this.runningGutterDecoration.dispose();
+    this.completedGutterDecoration.dispose();
+    this.failedGutterDecoration.dispose();
   }
 
   private removeTask(taskId: string): void {
@@ -228,11 +275,6 @@ export class ProjectionController implements vscode.Disposable {
       }
 
       const position = new vscode.Position(line, parsed.column - 1);
-      const annotationComment: vscode.Comment = {
-        author: { name: "Browser annotation" },
-        body: annotationBody(annotation),
-        mode: vscode.CommentMode.Preview,
-      };
       const progress: vscode.Comment = {
         author: { name: "Agentation server" },
         body: progressBody(task.state.snapshot),
@@ -241,17 +283,19 @@ export class ProjectionController implements vscode.Disposable {
       const thread = this.comments.createCommentThread(
         document.uri,
         document.lineAt(line).range,
-        [annotationComment, progress],
+        [...staticComments(annotation, task.state.snapshot.messages), progress],
       );
       thread.label = `Agentation: ${jobName(annotation.comment)}`;
       thread.contextValue = "piSelection.agentationReview";
       thread.state = vscode.CommentThreadState.Unresolved;
-      thread.canReply = false;
+      thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+      thread.canReply = isReplyable(task.state.snapshot);
 
       const job = createAnchorJob(task, annotation, key, resolved);
       const review: ProjectedReview = {
         key,
         taskId: task.id,
+        annotationId: annotation.id,
         signature,
         job,
         thread,
@@ -274,9 +318,15 @@ export class ProjectionController implements vscode.Disposable {
 
   private updateReview(review: ProjectedReview, task: ProjectedTask): void {
     const snapshot = task.state.snapshot;
+    const annotation = snapshot.annotations.find((candidate) => candidate.id === review.annotationId);
+    if (!annotation) return;
     updateJob(review.job, snapshot, task.state.feed);
-    review.progress = { ...review.progress, body: progressBody(snapshot) };
-    review.thread.comments = [review.thread.comments[0], review.progress];
+    review.progress.body = progressBody(snapshot);
+    review.thread.comments = [
+      ...staticComments(annotation, snapshot.messages),
+      review.progress,
+    ];
+    review.thread.canReply = isReplyable(snapshot);
   }
 
   private removeReview(task: ProjectedTask, review: ProjectedReview): void {
@@ -300,16 +350,34 @@ export class ProjectionController implements vscode.Disposable {
   }
 
   private refreshDecorations(): void {
+    const gutterDecorations = {
+      queued: this.queuedGutterDecoration,
+      running: this.runningGutterDecoration,
+      completed: this.completedGutterDecoration,
+      failed: this.failedGutterDecoration,
+    } as const;
     for (const editor of vscode.window.visibleTextEditors) {
-      const ranges = [...this.reviews.values()]
-        .filter((review) => !review.reviewed && review.uri.toString() === editor.document.uri.toString())
-        .map((review) => {
-          const position = editor.document.positionAt(
-            Math.min(review.offset, editor.document.getText().length),
-          );
-          return editor.document.lineAt(position.line).range;
-        });
-      editor.setDecorations(this.decoration, ranges);
+      const unresolved: vscode.Range[] = [];
+      const byStatus: Record<AgentationSnapshot["status"], vscode.Range[]> = {
+        queued: [],
+        running: [],
+        completed: [],
+        failed: [],
+      };
+      for (const review of this.reviews.values()) {
+        if (review.uri.toString() !== editor.document.uri.toString()) continue;
+        const position = editor.document.positionAt(
+          Math.min(review.offset, editor.document.getText().length),
+        );
+        const range = editor.document.lineAt(position.line).range;
+        const status = this.tasks.get(review.taskId)?.state.snapshot.status;
+        if (status) byStatus[status].push(range);
+        if (!review.reviewed) unresolved.push(range);
+      }
+      editor.setDecorations(this.decoration, unresolved);
+      for (const status of ["queued", "running", "completed", "failed"] as const) {
+        editor.setDecorations(gutterDecorations[status], byStatus[status]);
+      }
     }
   }
 }
@@ -421,8 +489,40 @@ function anchorSignature(snapshot: AgentationSnapshot, annotation: AgentationAnn
   return JSON.stringify([snapshot.cwd, annotation]);
 }
 
+function staticComments(
+  annotation: AgentationAnnotation,
+  messages: readonly AgentationMessage[] = [],
+): vscode.Comment[] {
+  return projectThreadItems(annotation, messages).map((item) => ({
+    author: {
+      name:
+        item.kind === "annotation"
+          ? "Browser annotation"
+          : item.message.role === "user"
+            ? "You"
+            : "Pi",
+    },
+    body:
+      item.kind === "annotation"
+        ? annotationBody(item.annotation)
+        : messageBody(item.message),
+    mode: vscode.CommentMode.Preview,
+  }));
+}
+
+function messageBody(message: AgentationMessage): vscode.MarkdownString {
+  const body = new vscode.MarkdownString();
+  body.isTrusted = false;
+  body.supportHtml = false;
+  if (message.role === "assistant") body.appendMarkdown(message.body);
+  else body.appendText(message.body);
+  return body;
+}
+
 function annotationBody(annotation: AgentationAnnotation): vscode.MarkdownString {
   const body = new vscode.MarkdownString();
+  body.isTrusted = false;
+  body.supportHtml = false;
   body.appendText(annotation.comment);
   const context = [annotation.element, annotation.elementPath, annotation.reactComponents]
     .filter(Boolean)
@@ -440,12 +540,31 @@ function annotationBody(annotation: AgentationAnnotation): vscode.MarkdownString
 
 function progressBody(snapshot: AgentationSnapshot): vscode.MarkdownString {
   const body = new vscode.MarkdownString();
-  body.appendMarkdown(`**${snapshot.detail}**`);
+  body.isTrusted = false;
+  body.supportHtml = false;
+  body.appendMarkdown("**");
+  body.appendText(snapshot.detail);
+  body.appendMarkdown("**");
   if (snapshot.error) {
     body.appendMarkdown("\n\n");
     body.appendText(snapshot.error);
-  } else if (snapshot.markdown) {
-    body.appendMarkdown(`\n\n${snapshot.markdown}`);
   }
   return body;
+}
+
+function isReplyable(snapshot: AgentationSnapshot): boolean {
+  return (
+    Boolean(snapshot.sessionFile) &&
+    (snapshot.status === "completed" || snapshot.status === "failed")
+  );
+}
+
+function createGutterDecoration(
+  extensionUri: vscode.Uri,
+  status: AgentationSnapshot["status"],
+): vscode.TextEditorDecorationType {
+  return vscode.window.createTextEditorDecorationType({
+    gutterIconPath: vscode.Uri.joinPath(extensionUri, "resources", `agentation-${status}.svg`),
+    gutterIconSize: "contain",
+  });
 }

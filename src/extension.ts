@@ -10,6 +10,7 @@ import {
 import { BufferBridge } from "./bridge";
 import { PiCoordinator, type PiJob, type SelectionRequest } from "./coordinator";
 import { ProjectionController } from "./projection";
+import { PendingReplyIds } from "./reply-idempotency";
 import {
   decideRejectionState,
   parseProjectionUri,
@@ -347,6 +348,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const coordinators = new Map<string, PiCoordinator>();
   const output = vscode.window.createOutputChannel("Pi Selection");
   const inlays = new SessionInlays();
+  const pendingReplyIds = new PendingReplyIds<vscode.CommentThread>();
   const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
   let projection: ProjectionController;
   const tree = new SessionTree(
@@ -355,6 +357,7 @@ export function activate(context: vscode.ExtensionContext): void {
     (job) => projection?.hasChanges(job) ?? false,
   );
   projection = new ProjectionController(
+    context.extensionUri,
     inlays,
     () => {
       tree.refresh();
@@ -587,6 +590,26 @@ export function activate(context: vscode.ExtensionContext): void {
       "piSelection.markReviewed",
       (thread: vscode.CommentThread) => projection.markReviewed(thread),
     ),
+    vscode.commands.registerCommand("piSelection.reply", async (reply: vscode.CommentReply) => {
+      if (!reply.text.trim()) throw new Error("Enter a reply before submitting.");
+      const target = projection.replyTarget(reply.thread);
+      if (!target) {
+        throw new Error("Replies are available only after Pi finishes and a session is ready.");
+      }
+      const client = projectionClient;
+      if (!client) throw new Error("Agentation projection client is not connected.");
+      const requestId = pendingReplyIds.requestId(reply.thread, reply.text, randomUUID);
+      projection.assertReplyTarget(reply.thread, target);
+      await client.postProjectionReply(
+        target.generation,
+        target.taskId,
+        target.annotationId,
+        reply.text,
+        requestId,
+        () => projection.assertReplyTarget(reply.thread, target),
+      );
+      pendingReplyIds.confirm(reply.thread, reply.text, requestId);
+    }),
     vscode.commands.registerCommand("piSelection.reviewChanges", async (target: unknown) => {
       const snapshot = projection.snapshotFor(target);
       if (!snapshot?.changes?.length) {
