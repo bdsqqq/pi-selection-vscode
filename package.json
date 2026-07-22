@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -113,7 +113,7 @@
       "comments/commentThread/context": [
         {
           "command": "piSelection.reply",
-          "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
+          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionThread) || (commentController == piSelection.agentation && commentThread == piSelection.agentationReview)",
           "group": "inline"
         }
       ],
@@ -125,7 +125,7 @@
         },
         {
           "command": "piSelection.markReviewed",
-          "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
+          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionThread) || (commentController == piSelection.agentation && commentThread == piSelection.agentationReview)",
           "group": "inline@2"
         }
       ],

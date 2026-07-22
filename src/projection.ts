@@ -396,6 +396,7 @@ function createTaskJob(snapshot: AgentationSnapshot, feed: string[]): PiJob {
     response: snapshot.markdown,
     error: snapshot.error,
     feed,
+    messages: (snapshot.messages ?? []).map(({ role, body }) => ({ role, body })),
     latestUpdate: latestUpdate(feed, snapshot.detail),
     activeToolCalls: new Map(),
     projected: true,
@@ -434,6 +435,7 @@ function updateJob(job: PiJob, snapshot: AgentationSnapshot, feed: string[]): vo
     response: snapshot.markdown,
     error: snapshot.error,
     feed,
+    messages: (snapshot.messages ?? []).map(({ role, body }) => ({ role, body })),
     latestUpdate: latestUpdate(feed, snapshot.detail),
   });
 }
@@ -564,7 +566,7 @@ function createGutterDecoration(
   status: AgentationSnapshot["status"],
 ): vscode.TextEditorDecorationType {
   return vscode.window.createTextEditorDecorationType({
-    gutterIconPath: vscode.Uri.joinPath(extensionUri, "resources", `agentation-${status}.svg`),
+    gutterIconPath: vscode.Uri.joinPath(extensionUri, "resources", `pi-status-${status}.svg`),
     gutterIconSize: "contain",
   });
 }

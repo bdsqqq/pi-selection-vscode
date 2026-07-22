@@ -20,6 +20,7 @@ import {
   Utf8LruCache,
 } from "./review-content";
 import { SessionInlays } from "./session-inlays";
+import { SelectionThreads } from "./selection-threads";
 import { exactReviewPath, isExactReviewPathContained } from "./source-file";
 import { PI_SELECTION_SYSTEM_PROMPT } from "./system-prompt";
 
@@ -348,6 +349,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const coordinators = new Map<string, PiCoordinator>();
   const output = vscode.window.createOutputChannel("Pi Selection");
   const inlays = new SessionInlays();
+  const selectionThreads = new SelectionThreads(context.extensionUri);
   const pendingReplyIds = new PendingReplyIds<vscode.CommentThread>();
   const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
   let projection: ProjectionController;
@@ -418,6 +420,7 @@ export function activate(context: vscode.ExtensionContext): void {
         onChange: () => {
           tree.refresh();
           inlays.refresh();
+          selectionThreads.refresh();
           for (const feed of feeds.values()) refreshFeed(feed.job, feed.quickPick);
         },
         log: (message) => output.appendLine(message),
@@ -525,6 +528,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output,
     inlays,
+    selectionThreads,
     projection,
     projectionContent,
     treeRegistration,
@@ -551,8 +555,17 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
+      if (editor.document.isDirty && !(await editor.document.save())) {
+        void vscode.window.showErrorMessage("Save the file before starting Pi.");
+        return;
+      }
       const selection = editor.selection;
+      if (selection.isEmpty) {
+        void vscode.window.showInformationMessage("The selection changed while saving; select the code again.");
+        return;
+      }
       const text = editor.document.getText(selection);
+      const documentVersion = editor.document.version;
       const request = await vscode.window.showInputBox({
         title: "Prompt Pi about the selection",
         prompt: `${path.relative(folder.uri.fsPath, editor.document.uri.fsPath)}:${selection.start.line + 1}-${selection.end.line + 1}`,
@@ -560,8 +573,10 @@ export function activate(context: vscode.ExtensionContext): void {
         ignoreFocusOut: true,
       });
       if (!request?.trim()) return;
-      if (editor.document.isDirty && !(await editor.document.save())) {
-        void vscode.window.showErrorMessage("Save the file before starting Pi.");
+      if (editor.document.version !== documentVersion || !editor.selection.isEqual(selection)) {
+        void vscode.window.showInformationMessage(
+          "The code or selection changed while entering the prompt; submit it again.",
+        );
         return;
       }
 
@@ -574,7 +589,8 @@ export function activate(context: vscode.ExtensionContext): void {
         text,
       };
       const job = coordinatorFor(folder).submit(submission);
-      inlays.track(job, editor.document, editor.selection.end);
+      selectionThreads.track(job, editor.document, selection, submission);
+      inlays.track(job, editor.document, selection.end);
       void vscode.window.setStatusBarMessage(`$(hubot) Pi started: ${job.name}`, 3_000);
     }),
     vscode.commands.registerCommand("piSelection.showFeed", (jobId: string) => {
@@ -586,12 +602,18 @@ export function activate(context: vscode.ExtensionContext): void {
         void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd, job.projected);
       }
     }),
-    vscode.commands.registerCommand(
-      "piSelection.markReviewed",
-      (thread: vscode.CommentThread) => projection.markReviewed(thread),
-    ),
+    vscode.commands.registerCommand("piSelection.markReviewed", (thread: vscode.CommentThread) => {
+      if (!selectionThreads.markReviewed(thread)) projection.markReviewed(thread);
+    }),
     vscode.commands.registerCommand("piSelection.reply", async (reply: vscode.CommentReply) => {
       if (!reply.text.trim()) throw new Error("Enter a reply before submitting.");
+      const selectionJob = selectionThreads.replyTarget(reply.thread);
+      if (selectionJob) {
+        const coordinator = coordinators.get(selectionJob.cwd);
+        if (!coordinator) throw new Error("The Pi selection session is no longer available.");
+        coordinator.reply(selectionJob, reply.text);
+        return;
+      }
       const target = projection.replyTarget(reply.thread);
       if (!target) {
         throw new Error("Replies are available only after Pi finishes and a session is ready.");
@@ -706,6 +728,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.commands.registerCommand("piSelection.clearCompleted", () => {
+      selectionThreads.removeFinished();
       for (const coordinator of coordinators.values()) coordinator.clearFinished();
       inlays.removeFinished();
     }),

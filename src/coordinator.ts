@@ -15,6 +15,11 @@ export type SelectionRequest = {
   text: string;
 };
 
+export type PiJobMessage = {
+  role: "user" | "assistant";
+  body: string;
+};
+
 export type PiJob = {
   id: string;
   name: string;
@@ -26,6 +31,7 @@ export type PiJob = {
   response?: string;
   error?: string;
   feed: string[];
+  messages: PiJobMessage[];
   latestUpdate: string;
   activeToolCalls: Map<string, string>;
   streamingFeedIndex?: number;
@@ -119,7 +125,11 @@ export class PiCoordinator {
   private readonly log: (message: string) => void;
   private readonly childLaunch: () => Promise<RpcLaunchOptions>;
   private readonly disposeChild: () => void;
+  private readonly streamingMessageIndices = new Map<string, number>();
+  private readonly operations = new Set<Promise<void>>();
   private parentPromise?: Promise<string>;
+  private disposePromise?: Promise<void>;
+  private disposed = false;
 
   constructor(options: CoordinatorOptions) {
     this.cwd = options.cwd;
@@ -135,6 +145,7 @@ export class PiCoordinator {
   }
 
   submit(request: SelectionRequest): PiJob {
+    if (this.disposed) throw new Error("coordinator is disposed");
     const job: PiJob = {
       id: randomUUID(),
       name: jobName(request.instruction),
@@ -143,12 +154,13 @@ export class PiCoordinator {
       status: "queued",
       detail: "creating session",
       feed: ["creating session"],
+      messages: [],
       latestUpdate: "creating session",
       activeToolCalls: new Map(),
     };
     this.jobs.unshift(job);
     this.changed();
-    void this.run(job, request);
+    this.track(this.run(job, request));
     return job;
   }
 
@@ -172,6 +184,28 @@ export class PiCoordinator {
     if (job.client) await job.client.abort();
   }
 
+  reply(job: PiJob, text: string): void {
+    if (this.disposed) throw new Error("coordinator is disposed");
+    if (!text.trim()) throw new Error("reply must not be blank");
+    if (!this.jobs.includes(job)) throw new Error("job does not belong to this coordinator");
+    if (!job.sessionFile) throw new Error("job does not have a session");
+    if (!["completed", "failed", "aborted"].includes(job.status)) {
+      throw new Error("job is already queued or running");
+    }
+
+    job.messages.push({ role: "user", body: text });
+    job.status = "queued";
+    job.detail = "reply queued";
+    job.response = undefined;
+    job.error = undefined;
+    job.streamingFeedIndex = undefined;
+    this.streamingMessageIndices.delete(job.id);
+    job.abortRequested = false;
+    job.activeToolCalls.clear();
+    this.changed();
+    this.track(this.continue(job, text));
+  }
+
   clearFinished(): void {
     for (let index = this.jobs.length - 1; index >= 0; index -= 1) {
       if (!["queued", "running"].includes(this.jobs[index].status)) this.jobs.splice(index, 1);
@@ -179,14 +213,21 @@ export class PiCoordinator {
     this.changed();
   }
 
-  async dispose(): Promise<void> {
-    await Promise.all(
-      this.jobs.flatMap((job) => {
-        if (!job.client || !["queued", "running"].includes(job.status)) return [];
-        job.client.terminate();
-        return [job.client.close()];
-      }),
-    );
+  dispose(): Promise<void> {
+    this.disposePromise ??= this.disposeOperations();
+    return this.disposePromise;
+  }
+
+  private async disposeOperations(): Promise<void> {
+    this.disposed = true;
+    for (const job of this.jobs) {
+      if (!["queued", "running"].includes(job.status)) continue;
+      job.abortRequested = true;
+      job.detail = "aborting";
+      job.client?.terminate();
+    }
+    this.changed();
+    await Promise.all([...this.operations]);
     this.disposeChild();
   }
 
@@ -194,71 +235,114 @@ export class PiCoordinator {
     let client: RpcClient | undefined;
     try {
       const parentSession = await this.parentSession();
-      if (job.abortRequested) {
-        job.status = "aborted";
-        job.detail = "aborted";
-        return;
-      }
+      this.assertActive(job);
+      const launch = await this.childLaunch();
+      this.assertActive(job);
 
-      client = new RpcClient(
-        this.piPath,
-        this.cwd,
-        (event) => this.handleEvent(job, event),
-        await this.childLaunch(),
-      );
+      client = new RpcClient(this.piPath, this.cwd, (event) => this.handleEvent(job, event), launch);
       job.client = client;
       const newSession = await client.request<SessionData>({ type: "new_session", parentSession });
+      this.assertActive(job);
       if (newSession.data?.cancelled) throw new Error("pi cancelled child session creation");
       await client.request({ type: "set_session_name", name: `selection: ${job.name}` });
+      this.assertActive(job);
       const state = await client.request<StateData>({ type: "get_state" });
+      this.assertActive(job);
       job.sessionFile = state.data?.sessionFile;
-      if (job.abortRequested) {
-        job.status = "aborted";
-        job.detail = "aborted";
-        return;
-      }
-      job.status = "running";
-      job.detail = "running";
-      job.latestUpdate = "session started";
-      job.feed.push(job.latestUpdate);
-      this.changed();
-
-      const settled = client.waitForEvent("agent_settled");
-      await client.request({ type: "prompt", message: selectionPrompt(request) });
-      await settled;
-
-      const messages = await client.request<MessagesData>({ type: "get_messages" });
-      const response = await client.request<TextData>({ type: "get_last_assistant_text" });
-      const lastAssistant = (messages.data?.messages ?? [])
-        .toReversed()
-        .find(({ role }) => role === "assistant");
-      job.response = response.data?.text ?? undefined;
-      if (job.response) {
-        job.latestUpdate = latestUpdate([job.response], job.detail);
-        if (job.feed.at(-1) !== job.response) job.feed.push(job.response);
-      }
-      if (job.abortRequested || lastAssistant?.stopReason === "aborted") {
-        job.status = "aborted";
-        job.detail = "aborted";
-      } else if (lastAssistant?.stopReason === "error") {
-        throw new Error("pi ended with an error");
-      } else {
-        job.status = "completed";
-        job.detail = "completed";
-      }
-      this.log(`[${job.name}] ${job.detail}${job.response ? `\n${job.response}\n` : ""}`);
+      await this.runPrompt(job, client, selectionPrompt(request), "session started");
     } catch (error) {
-      job.status = job.abortRequested ? "aborted" : "failed";
-      job.error = error instanceof Error ? error.message : String(error);
-      job.detail = job.status === "aborted" ? "aborted" : "failed";
-      job.latestUpdate = job.error;
-      job.feed.push(job.error);
-      this.log(`[${job.name}] ${job.error}`);
+      this.fail(job, error);
     } finally {
-      job.client = undefined;
+      if (job.client === client) job.client = undefined;
       await client?.close();
       this.changed();
     }
+  }
+
+  private async continue(job: PiJob, text: string): Promise<void> {
+    let client: RpcClient | undefined;
+    try {
+      const launch = await this.childLaunch();
+      this.assertActive(job);
+      client = new RpcClient(this.piPath, this.cwd, (event) => this.handleEvent(job, event), launch);
+      job.client = client;
+      const switched = await client.request<SessionData>({
+        type: "switch_session",
+        sessionPath: job.sessionFile,
+      });
+      this.assertActive(job);
+      if (switched.data?.cancelled) throw new Error("pi cancelled session switch");
+      await this.runPrompt(job, client, text, "reply started");
+    } catch (error) {
+      this.fail(job, error);
+    } finally {
+      if (job.client === client) job.client = undefined;
+      await client?.close();
+      this.changed();
+    }
+  }
+
+  private async runPrompt(
+    job: PiJob,
+    client: RpcClient,
+    message: string,
+    startedUpdate: string,
+  ): Promise<void> {
+    this.assertActive(job);
+    const messageBoundary = job.messages.length;
+    job.status = "running";
+    job.detail = "running";
+    job.latestUpdate = startedUpdate;
+    job.feed.push(job.latestUpdate);
+    this.changed();
+
+    const settled = client.waitForEvent("agent_settled");
+    await client.request({ type: "prompt", message });
+    await settled;
+
+    const messages = await client.request<MessagesData>({ type: "get_messages" });
+    const response = await client.request<TextData>({ type: "get_last_assistant_text" });
+    const lastAssistant = (messages.data?.messages ?? [])
+      .toReversed()
+      .find(({ role }) => role === "assistant");
+    this.finalizeAssistant(job, response.data?.text ?? undefined, messageBoundary);
+    if (job.abortRequested || lastAssistant?.stopReason === "aborted") {
+      job.status = "aborted";
+      job.detail = "aborted";
+    } else if (lastAssistant?.stopReason === "error") {
+      throw new Error("pi ended with an error");
+    } else {
+      job.status = "completed";
+      job.detail = "completed";
+    }
+    this.log(`[${job.name}] ${job.detail}${job.response ? `\n${job.response}\n` : ""}`);
+  }
+
+  private finalizeAssistant(
+    job: PiJob,
+    response: string | undefined,
+    messageBoundary: number,
+  ): void {
+    const messageIndex = job.messages.findLastIndex(
+      ({ role }, index) => index >= messageBoundary && role === "assistant",
+    );
+    if (messageIndex === -1) return;
+    job.response = response;
+    if (response) {
+      job.messages[messageIndex].body = response;
+      job.latestUpdate = latestUpdate([response], job.detail);
+      if (job.feed.at(-1) !== response) job.feed.push(response);
+    }
+  }
+
+  private fail(job: PiJob, error: unknown): void {
+    job.status = job.abortRequested ? "aborted" : "failed";
+    job.error = error instanceof Error ? error.message : String(error);
+    job.detail = job.status === "aborted" ? "aborted" : "failed";
+    job.latestUpdate = job.error;
+    job.feed.push(job.error);
+    this.streamingMessageIndices.delete(job.id);
+    this.log(`[${job.name}] ${job.error}`);
   }
 
   private handleEvent(job: PiJob, event: RpcRecord): void {
@@ -269,18 +353,26 @@ export class PiCoordinator {
       if (delta.type === "text_start") {
         job.feed.push("");
         job.streamingFeedIndex = job.feed.length - 1;
+        const messageIndex = job.messages.push({ role: "assistant", body: "" }) - 1;
+        this.streamingMessageIndices.set(job.id, messageIndex);
       } else if (delta.type === "text_delta" && typeof delta.delta === "string") {
-        job.streamingFeedIndex ??= job.feed.push("") - 1;
+        const messageIndex = this.streamingMessageIndices.get(job.id);
+        if (messageIndex === undefined || job.streamingFeedIndex === undefined) return;
         job.feed[job.streamingFeedIndex] += delta.delta;
+        job.messages[messageIndex].body += delta.delta;
       } else if (delta.type === "text_end" && typeof delta.content === "string") {
-        job.streamingFeedIndex ??= job.feed.push("") - 1;
+        const messageIndex = this.streamingMessageIndices.get(job.id);
+        if (messageIndex === undefined || job.streamingFeedIndex === undefined) return;
         job.feed[job.streamingFeedIndex] = delta.content;
+        job.messages[messageIndex].body = delta.content;
         job.streamingFeedIndex = undefined;
+        this.streamingMessageIndices.delete(job.id);
       } else {
         return;
       }
+      const streamingMessageIndex = this.streamingMessageIndices.get(job.id);
       job.latestUpdate = latestUpdate(
-        job.streamingFeedIndex === undefined ? job.feed : [job.feed[job.streamingFeedIndex]],
+        streamingMessageIndex === undefined ? job.feed : [job.messages[streamingMessageIndex].body],
         job.detail,
       );
       this.changed();
@@ -300,6 +392,18 @@ export class PiCoordinator {
           : "running";
       this.changed();
     }
+  }
+
+  private assertActive(job: PiJob): void {
+    if (this.disposed || job.abortRequested) throw new Error("coordinator operation aborted");
+  }
+
+  private track(operation: Promise<void>): void {
+    this.operations.add(operation);
+    void operation.then(
+      () => this.operations.delete(operation),
+      () => this.operations.delete(operation),
+    );
   }
 
   private changed(): void {
