@@ -12,17 +12,17 @@ When a task snapshot includes changed paths, **Review Changes** fetches generati
 
 VS Code's stable Comments API, virtual-document providers, and `TextEditorDecorationType` are review projections, not editable inline suggestions or fake completions. A small status badge occupies the bottom-right of the gutter decoration so the native Comments glyph remains the interaction target where the renderer permits. Decoration icons are not clickable, and VS Code controls how much the two gutter visuals overlap.
 
-The selected-code `Cmd+K` workflow remains independent. It starts its own constrained Pi child session and buffer bridge; projected Agentation tasks never use that path.
+The selected-code `Cmd+I` workflow remains independent. It starts its own constrained Pi child session and buffer bridge; projected Agentation tasks never use that path.
 
 ## Use
 
-1. Install `pi-selection-0.4.0.vsix` with **Extensions: Install from VSIX…**.
+1. Install `pi-selection-0.4.1.vsix` with **Extensions: Install from VSIX…**.
 2. Open a trusted folder where `pi` already works.
-3. Select code and press `Cmd+K` (`Ctrl+K` elsewhere).
+3. Select code and press `Cmd+I` (`Ctrl+I` elsewhere).
 4. Enter an instruction. A clickable inlay tracks the selection and streams Pi's latest update; VSCodium's native renderer handles viewport clipping.
 5. Click the inlay to view the live session feed; select a feed entry to open that session as a terminal editor. Reopening a session reveals its existing editor instead of creating another.
 
-Cursor owns `Cmd+K` by default. Disable Cursor's binding, or assign `piSelection.submit` another shortcut in **Preferences: Open Keyboard Shortcuts**.
+`Cmd+I` intentionally reuses the inline-chat slot; VSCodium's built-in AI features are disabled in this setup. Assign `piSelection.submit` another shortcut in **Preferences: Open Keyboard Shortcuts** if inline chat is enabled.
 
 The extension creates one lightweight parent session per workspace window. Every submitted prompt becomes a named child session linked to that parent, so the sessions remain available through Pi's normal `/resume` interface.
 

@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -72,8 +72,8 @@
     "keybindings": [
       {
         "command": "piSelection.submit",
-        "key": "ctrl+k",
-        "mac": "cmd+k",
+        "key": "ctrl+i",
+        "mac": "cmd+i",
         "when": "editorTextFocus"
       }
     ],
