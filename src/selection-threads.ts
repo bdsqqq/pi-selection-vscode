@@ -66,7 +66,7 @@ export class SelectionThreads implements vscode.Disposable {
     const thread = this.comments.createCommentThread(document.uri, range, [
       requestComment,
       ...messageComments,
-      progressComment,
+      ...progressComments(job, progressComment),
     ]);
     thread.label = `Pi: ${job.name}`;
     thread.contextValue = "piSelection.selectionThread";
@@ -96,7 +96,7 @@ export class SelectionThreads implements vscode.Disposable {
       selection.thread.comments = [
         selection.requestComment,
         ...renderMessageComments(messagesFor(selection.job)),
-        selection.progressComment,
+        ...progressComments(selection.job, selection.progressComment),
       ];
       selection.thread.label = `Pi: ${selection.job.name}`;
       selection.thread.canReply = isSelectionReplyable(selection.job);
@@ -227,6 +227,10 @@ function renderMessageComment(message: SelectionThreadMessage): vscode.Comment {
     body,
     mode: vscode.CommentMode.Preview,
   };
+}
+
+function progressComments(job: PiJob, comment: vscode.Comment): vscode.Comment[] {
+  return job.status === "completed" ? [] : [comment];
 }
 
 function progressBody(job: PiJob): vscode.MarkdownString {
