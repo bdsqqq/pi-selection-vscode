@@ -30,9 +30,10 @@ export function selectionThreadItems(
 export function isSelectionReplyable(job: {
   status: JobStatus;
   sessionFile?: string;
+  sessionId?: string;
 }): boolean {
   return (
-    Boolean(job.sessionFile) &&
+    Boolean(job.sessionFile && job.sessionId) &&
     (job.status === "completed" || job.status === "failed" || job.status === "aborted")
   );
 }

@@ -33,14 +33,21 @@ test("selection thread items keep the request first and messages ordered", () =>
   );
 });
 
-test("only terminal jobs with a session file are replyable", () => {
+test("only terminal jobs with a complete session identity are replyable", () => {
   for (const status of ["completed", "failed", "aborted"] as const) {
-    assert.equal(isSelectionReplyable({ status, sessionFile: "/tmp/session.jsonl" }), true);
+    assert.equal(
+      isSelectionReplyable({ status, sessionFile: "/tmp/session.jsonl", sessionId: "session-1" }),
+      true,
+    );
   }
   for (const status of ["queued", "running"] as const) {
-    assert.equal(isSelectionReplyable({ status, sessionFile: "/tmp/session.jsonl" }), false);
+    assert.equal(
+      isSelectionReplyable({ status, sessionFile: "/tmp/session.jsonl", sessionId: "session-1" }),
+      false,
+    );
   }
   assert.equal(isSelectionReplyable({ status: "completed" }), false);
+  assert.equal(isSelectionReplyable({ status: "completed", sessionFile: "/tmp/session.jsonl" }), false);
 });
 
 test("aborted jobs use the packaged failure status decoration", () => {

@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { constants } from "node:fs";
+import { mkdir, open, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute } from "node:path";
 import { latestUpdate } from "./inlay-text";
 import { RpcClient, type RpcLaunchOptions, type RpcRecord } from "./rpc";
 
@@ -28,6 +29,7 @@ export type PiJob = {
   status: JobStatus;
   detail: string;
   sessionFile?: string;
+  sessionId?: string;
   response?: string;
   error?: string;
   feed: string[];
@@ -40,10 +42,29 @@ export type PiJob = {
   projected?: boolean;
 };
 
+export type RestoredPiJob = Readonly<
+  Pick<
+    PiJob,
+    | "id"
+    | "name"
+    | "file"
+    | "cwd"
+    | "status"
+    | "detail"
+    | "sessionFile"
+    | "sessionId"
+    | "response"
+    | "error"
+  > & {
+    messages: readonly PiJobMessage[];
+    projected?: boolean;
+  }
+>;
+
 type CoordinatorOptions = {
   cwd: string;
   piPath: string;
-  onChange: () => void;
+  onChange: (job?: PiJob) => void;
   log: (message: string) => void;
   childLaunch: () => Promise<RpcLaunchOptions>;
   disposeChild: () => void;
@@ -74,6 +95,46 @@ export function selectionPrompt(request: SelectionRequest): string {
     request.text,
     "--- end selected text ---",
   ].join("\n");
+}
+
+export async function assertSessionFileIdentity(
+  sessionFile: string,
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  if (!isAbsolute(sessionFile)) throw new Error("session file path must be absolute");
+
+  const handle = await open(sessionFile, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) throw new Error("session file must be a regular file");
+
+    const buffer = Buffer.alloc(64 * 1_024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+    if (newline === -1 && bytesRead === buffer.length) throw new Error("session header exceeds size limit");
+    const firstLine = buffer.subarray(0, newline === -1 ? bytesRead : newline).toString("utf8");
+    let header: unknown;
+    try {
+      header = JSON.parse(firstLine);
+    } catch {
+      throw new Error("session header is not valid JSON");
+    }
+    if (
+      !header ||
+      typeof header !== "object" ||
+      Array.isArray(header) ||
+      (header as { type?: unknown }).type !== "session" ||
+      typeof (header as { id?: unknown }).id !== "string" ||
+      typeof (header as { cwd?: unknown }).cwd !== "string"
+    ) {
+      throw new Error("session header is invalid");
+    }
+    if ((header as { id: string }).id !== sessionId) throw new Error("session id does not match");
+    if ((header as { cwd: string }).cwd !== cwd) throw new Error("session cwd does not match");
+  } finally {
+    await handle.close();
+  }
 }
 
 async function createParentSession(piPath: string, cwd: string): Promise<string> {
@@ -121,7 +182,7 @@ export class PiCoordinator {
   private readonly jobs: PiJob[] = [];
   private readonly cwd: string;
   private readonly piPath: string;
-  private readonly onChange: () => void;
+  private readonly onChange: (job?: PiJob) => void;
   private readonly log: (message: string) => void;
   private readonly childLaunch: () => Promise<RpcLaunchOptions>;
   private readonly disposeChild: () => void;
@@ -144,6 +205,38 @@ export class PiCoordinator {
     return this.jobs;
   }
 
+  restoreJob(snapshot: RestoredPiJob): PiJob {
+    if (this.disposed) throw new Error("coordinator is disposed");
+    if (snapshot.cwd !== this.cwd) throw new Error("restored job cwd differs from coordinator cwd");
+    if (this.jobs.some(({ id }) => id === snapshot.id)) throw new Error("restored job id already exists");
+    if (snapshot.projected) throw new Error("projected jobs cannot be restored");
+    if (snapshot.status === "queued" || snapshot.status === "running") {
+      throw new Error("restored job status must be finished");
+    }
+
+    const messages = snapshot.messages.slice(-1_000).map(({ role, body }) => ({ role, body }));
+    const feed = [snapshot.detail, ...messages.map(({ body }) => body).filter((body) => body.trim())];
+    const job: PiJob = {
+      id: snapshot.id,
+      name: snapshot.name,
+      file: snapshot.file,
+      cwd: snapshot.cwd,
+      status: snapshot.status,
+      detail: snapshot.detail,
+      sessionFile: snapshot.sessionFile,
+      sessionId: snapshot.sessionId,
+      response: snapshot.response,
+      error: snapshot.error,
+      feed,
+      messages,
+      latestUpdate: latestUpdate(feed, snapshot.detail),
+      activeToolCalls: new Map(),
+    };
+    this.jobs.unshift(job);
+    this.changed(job);
+    return job;
+  }
+
   submit(request: SelectionRequest): PiJob {
     if (this.disposed) throw new Error("coordinator is disposed");
     const job: PiJob = {
@@ -159,7 +252,7 @@ export class PiCoordinator {
       activeToolCalls: new Map(),
     };
     this.jobs.unshift(job);
-    this.changed();
+    this.changed(job);
     this.track(this.run(job, request));
     return job;
   }
@@ -180,7 +273,7 @@ export class PiCoordinator {
     if (job.status !== "running" && job.status !== "queued") return;
     job.abortRequested = true;
     job.detail = "aborting";
-    this.changed();
+    this.changed(job);
     if (job.client) await job.client.abort();
   }
 
@@ -188,7 +281,7 @@ export class PiCoordinator {
     if (this.disposed) throw new Error("coordinator is disposed");
     if (!text.trim()) throw new Error("reply must not be blank");
     if (!this.jobs.includes(job)) throw new Error("job does not belong to this coordinator");
-    if (!job.sessionFile) throw new Error("job does not have a session");
+    if (!job.sessionFile || !job.sessionId) throw new Error("job does not have a session identity");
     if (!["completed", "failed", "aborted"].includes(job.status)) {
       throw new Error("job is already queued or running");
     }
@@ -202,7 +295,7 @@ export class PiCoordinator {
     this.streamingMessageIndices.delete(job.id);
     job.abortRequested = false;
     job.activeToolCalls.clear();
-    this.changed();
+    this.changed(job);
     this.track(this.continue(job, text));
   }
 
@@ -248,14 +341,17 @@ export class PiCoordinator {
       this.assertActive(job);
       const state = await client.request<StateData>({ type: "get_state" });
       this.assertActive(job);
-      job.sessionFile = state.data?.sessionFile;
+      const { sessionFile, sessionId } = state.data ?? {};
+      if (!sessionFile || !sessionId) throw new Error("pi did not provide a child session identity");
+      job.sessionFile = sessionFile;
+      job.sessionId = sessionId;
       await this.runPrompt(job, client, selectionPrompt(request), "session started");
     } catch (error) {
       this.fail(job, error);
     } finally {
       if (job.client === client) job.client = undefined;
       await client?.close();
-      this.changed();
+      this.changed(job);
     }
   }
 
@@ -266,19 +362,33 @@ export class PiCoordinator {
       this.assertActive(job);
       client = new RpcClient(this.piPath, this.cwd, (event) => this.handleEvent(job, event), launch);
       job.client = client;
+      const { sessionFile, sessionId } = job;
+      if (!sessionFile || !sessionId) throw new Error("job does not have a session identity");
+      const expectedSessionFile = await realpath(sessionFile);
+      await assertSessionFileIdentity(sessionFile, sessionId, this.cwd);
       const switched = await client.request<SessionData>({
         type: "switch_session",
-        sessionPath: job.sessionFile,
+        sessionPath: sessionFile,
       });
       this.assertActive(job);
       if (switched.data?.cancelled) throw new Error("pi cancelled session switch");
+      const state = await client.request<StateData>({ type: "get_state" });
+      this.assertActive(job);
+      if (state.data?.sessionId !== sessionId || !state.data.sessionFile) {
+        throw new Error("pi switched to a different session identity");
+      }
+      const switchedSessionFile = await realpath(state.data.sessionFile);
+      if (switchedSessionFile !== expectedSessionFile) {
+        throw new Error("pi switched to a different session file");
+      }
+      await assertSessionFileIdentity(state.data.sessionFile, sessionId, this.cwd);
       await this.runPrompt(job, client, text, "reply started");
     } catch (error) {
       this.fail(job, error);
     } finally {
       if (job.client === client) job.client = undefined;
       await client?.close();
-      this.changed();
+      this.changed(job);
     }
   }
 
@@ -294,7 +404,7 @@ export class PiCoordinator {
     job.detail = "running";
     job.latestUpdate = startedUpdate;
     job.feed.push(job.latestUpdate);
-    this.changed();
+    this.changed(job);
 
     const settled = client.waitForEvent("agent_settled");
     await client.request({ type: "prompt", message });
@@ -375,7 +485,7 @@ export class PiCoordinator {
         streamingMessageIndex === undefined ? job.feed : [job.messages[streamingMessageIndex].body],
         job.detail,
       );
-      this.changed();
+      this.changed(job);
     } else if (event.type === "tool_execution_start") {
       const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
       const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : `${Date.now()}`;
@@ -383,14 +493,14 @@ export class PiCoordinator {
       job.detail = `running · ${[...job.activeToolCalls.values()].join(", ")}`;
       job.latestUpdate = `running: ${toolName}`;
       job.feed.push(job.latestUpdate);
-      this.changed();
+      this.changed(job);
     } else if (event.type === "tool_execution_end") {
       if (typeof event.toolCallId === "string") job.activeToolCalls.delete(event.toolCallId);
       job.detail =
         job.activeToolCalls.size > 0
           ? `running · ${[...job.activeToolCalls.values()].join(", ")}`
           : "running";
-      this.changed();
+      this.changed(job);
     }
   }
 
@@ -406,7 +516,7 @@ export class PiCoordinator {
     );
   }
 
-  private changed(): void {
-    this.onChange();
+  private changed(job?: PiJob): void {
+    this.onChange(job);
   }
 }

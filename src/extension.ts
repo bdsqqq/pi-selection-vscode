@@ -345,11 +345,17 @@ function refreshFeed(job: PiJob, quickPick: vscode.QuickPick<vscode.QuickPickIte
   });
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+let shutdownExtension: (() => Promise<void>) | undefined;
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const coordinators = new Map<string, PiCoordinator>();
   const output = vscode.window.createOutputChannel("Pi Selection");
   const inlays = new SessionInlays();
-  const selectionThreads = new SelectionThreads(context.extensionUri);
+  const selectionThreads = new SelectionThreads(
+    context.extensionUri,
+    context.workspaceState,
+    (message) => output.appendLine(message),
+  );
   const pendingReplyIds = new PendingReplyIds<vscode.CommentThread>();
   const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
   let projection: ProjectionController;
@@ -417,10 +423,10 @@ export function activate(context: vscode.ExtensionContext): void {
       coordinator = new PiCoordinator({
         cwd,
         piPath,
-        onChange: () => {
+        onChange: (job) => {
           tree.refresh();
           inlays.refresh();
-          selectionThreads.refresh();
+          selectionThreads.refresh(job);
           for (const feed of feeds.values()) refreshFeed(feed.job, feed.quickPick);
         },
         log: (message) => output.appendLine(message),
@@ -451,6 +457,20 @@ export function activate(context: vscode.ExtensionContext): void {
       tree.refresh();
     }
     return coordinator;
+  };
+
+  await selectionThreads.restore((folder, snapshot) =>
+    coordinatorFor(folder).restoreJob(snapshot),
+  );
+
+  let shutdownPromise: Promise<void> | undefined;
+  shutdownExtension = () => {
+    shutdownPromise ??= (async () => {
+      await Promise.all([...coordinators.values()].map((coordinator) => coordinator.dispose()));
+      selectionThreads.refresh();
+      await selectionThreads.flush();
+    })();
+    return shutdownPromise;
   };
 
   const activeCoordinator = (): PiCoordinator | undefined => {
@@ -566,6 +586,13 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const text = editor.document.getText(selection);
       const documentVersion = editor.document.version;
+      let sourceRealPath: string;
+      try {
+        sourceRealPath = await realpath(editor.document.uri.fsPath);
+      } catch {
+        void vscode.window.showErrorMessage("The selected file is no longer available.");
+        return;
+      }
       const request = await vscode.window.showInputBox({
         title: "Prompt Pi about the selection",
         prompt: `${path.relative(folder.uri.fsPath, editor.document.uri.fsPath)}:${selection.start.line + 1}-${selection.end.line + 1}`,
@@ -573,9 +600,17 @@ export function activate(context: vscode.ExtensionContext): void {
         ignoreFocusOut: true,
       });
       if (!request?.trim()) return;
-      if (editor.document.version !== documentVersion || !editor.selection.isEqual(selection)) {
+      let currentSourceRealPath: string | undefined;
+      try {
+        currentSourceRealPath = await realpath(editor.document.uri.fsPath);
+      } catch {}
+      if (
+        editor.document.version !== documentVersion ||
+        !editor.selection.isEqual(selection) ||
+        currentSourceRealPath !== sourceRealPath
+      ) {
         void vscode.window.showInformationMessage(
-          "The code or selection changed while entering the prompt; submit it again.",
+          "The code, selection, or source file changed while entering the prompt; submit it again.",
         );
         return;
       }
@@ -589,7 +624,7 @@ export function activate(context: vscode.ExtensionContext): void {
         text,
       };
       const job = coordinatorFor(folder).submit(submission);
-      selectionThreads.track(job, editor.document, selection, submission);
+      selectionThreads.track(job, editor.document, selection, submission, sourceRealPath);
       inlays.track(job, editor.document, selection.end);
       void vscode.window.setStatusBarMessage(`$(hubot) Pi started: ${job.name}`, 3_000);
     }),
@@ -732,12 +767,10 @@ export function activate(context: vscode.ExtensionContext): void {
       for (const coordinator of coordinators.values()) coordinator.clearFinished();
       inlays.removeFinished();
     }),
-    {
-      dispose: () => {
-        void Promise.all([...coordinators.values()].map((coordinator) => coordinator.dispose()));
-      },
-    },
   );
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+  await shutdownExtension?.();
+  shutdownExtension = undefined;
+}
