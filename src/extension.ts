@@ -459,9 +459,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return coordinator;
   };
 
-  await selectionThreads.restore((folder, snapshot) =>
+  const restoredSelections = await selectionThreads.restore((folder, snapshot) =>
     coordinatorFor(folder).restoreJob(snapshot),
   );
+  for (const { job, document, position } of restoredSelections) {
+    inlays.track(job, document, position);
+  }
 
   let shutdownPromise: Promise<void> | undefined;
   shutdownExtension = () => {

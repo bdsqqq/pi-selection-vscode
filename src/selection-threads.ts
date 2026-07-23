@@ -40,6 +40,12 @@ type TrackedSelection = {
   fingerprint: string;
 };
 
+export type RestoredSelectionView = {
+  job: PiJob;
+  document: vscode.TextDocument;
+  position: vscode.Position;
+};
+
 type RestoredSelection = {
   id: string;
   request: SelectionRequest;
@@ -114,18 +120,20 @@ export class SelectionThreads implements vscode.Disposable {
 
   async restore(
     restoreJob: (folder: vscode.WorkspaceFolder, snapshot: RestoredPiJob) => PiJob,
-  ): Promise<void> {
+  ): Promise<RestoredSelectionView[]> {
     const stored = parseSelectionStore(
       this.workspaceState.get<unknown>(SELECTION_THREAD_STORE_KEY),
     );
+    const views: RestoredSelectionView[] = [];
     for (const record of stored.records) {
       try {
-        await this.restoreRecord(record, restoreJob);
+        views.push(await this.restoreRecord(record, restoreJob));
       } catch (error) {
         this.persistenceLog(`skipped ${record.id}: ${errorMessage(error)}`);
       }
     }
     await this.flush();
+    return views;
   }
 
   async flush(): Promise<void> {
@@ -270,7 +278,7 @@ export class SelectionThreads implements vscode.Disposable {
   private async restoreRecord(
     record: PersistedSelectionThread,
     restoreJob: (folder: vscode.WorkspaceFolder, snapshot: RestoredPiJob) => PiJob,
-  ): Promise<void> {
+  ): Promise<RestoredSelectionView> {
     const uri = vscode.Uri.parse(record.source.uri, true);
     if (uri.scheme !== "file") throw new Error("source is not a file URI");
     const folder = vscode.workspace.getWorkspaceFolder(uri);
@@ -341,6 +349,7 @@ export class SelectionThreads implements vscode.Disposable {
       startOffset: record.source.startOffset,
       endOffset: record.source.endOffset,
     });
+    return { job, document, position: range.end };
   }
 
   private schedulePersistence(): void {

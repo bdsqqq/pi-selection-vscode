@@ -6,7 +6,7 @@ A small VS Code/Cursor bridge for sending selected code to independent Pi sessio
 
 The editor-owned `Cmd+I` workflow is primary: selecting code creates a constrained Pi child session plus a GitHub-style native comment thread anchored to that exact range. New threads start folded. The thread streams Pi messages and tool status, exposes a gutter badge, tracks edits, and sends native replies back into the same Pi session. A clickable inlay and Pi Sessions tree remain alternate views of that session.
 
-Selection threads persist in versioned, bounded workspace state and return after editor reloads. Restore verifies the exact workspace path, source realpath, tracked range fingerprint, and Pi session file before reattaching a thread; stale records fail closed rather than moving onto unrelated code. Interrupted work restores as aborted, while a valid saved session remains replyable. The store retains at most 100 threads and 2 MiB, prioritizing unresolved recent work.
+Selection threads persist in versioned, bounded workspace state and return after editor reloads with their matching tree item, gutter status, and clickable inlay. Restore verifies the exact workspace path, source realpath, tracked range fingerprint, and Pi session file before reattaching a thread; stale records fail closed rather than moving onto unrelated code. Interrupted work restores as aborted, while a valid saved session remains replyable. The store retains at most 100 threads and 2 MiB, prioritizing unresolved recent work.
 
 Agentation is an optional browser/canvas ingress for this project. Its independent server owns browser annotation intake and execution; the editor projects those tasks through the same review primitives without making the editor workflow depend on Agentation. This follows the project direction described in [the original browser/editor/canvas thread](https://x.com/bedesqui/status/2079612948931018821).
 
@@ -20,7 +20,7 @@ Selection sessions and projected browser sessions share presentation primitives 
 
 ## Use
 
-1. Install `pi-selection-0.6.1.vsix` with **Extensions: Install from VSIX…**.
+1. Install `pi-selection-0.6.2.vsix` with **Extensions: Install from VSIX…**.
 2. Open a trusted folder where `pi` already works.
 3. Select code and press `Cmd+I` (`Ctrl+I` elsewhere).
 4. Enter an instruction. A folded native comment thread and gutter status badge anchor to the selected range while Pi works.
