@@ -2,7 +2,7 @@
   "name": "pi-selection",
   "displayName": "Pi Selection",
   "description": "Send selected code to background Pi sessions.",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "private": true,
   "publisher": "igorbedesqui",
   "license": "MIT",
@@ -22,6 +22,10 @@
     "onCommand:piSelection.reply",
     "onCommand:piSelection.reviewChanges",
     "onCommand:piSelection.rejectChange",
+    "onCommand:piSelection.revealThread",
+    "onCommand:piSelection.replyThread",
+    "onCommand:piSelection.settleThread",
+    "onCommand:piSelection.reopenThread",
     "onView:piSelection.sessions"
   ],
   "main": "./out/extension.js",
@@ -29,7 +33,8 @@
     "commands": [
       {
         "command": "piSelection.submit",
-        "title": "Pi: Prompt About Selection"
+        "title": "Pi: Prompt About Selection",
+        "icon": "$(add)"
       },
       {
         "command": "piSelection.openSession",
@@ -45,7 +50,7 @@
       },
       {
         "command": "piSelection.clearCompleted",
-        "title": "Pi: Clear Finished Sessions"
+        "title": "Pi: Clear Settled Threads"
       },
       {
         "command": "piSelection.reply",
@@ -54,8 +59,27 @@
       },
       {
         "command": "piSelection.markReviewed",
-        "title": "Mark Reviewed",
+        "title": "Settle Thread",
         "icon": "$(check)"
+      },
+      {
+        "command": "piSelection.revealThread",
+        "title": "Reveal Thread"
+      },
+      {
+        "command": "piSelection.replyThread",
+        "title": "Reply to Thread",
+        "icon": "$(reply)"
+      },
+      {
+        "command": "piSelection.settleThread",
+        "title": "Settle Thread",
+        "icon": "$(check)"
+      },
+      {
+        "command": "piSelection.reopenThread",
+        "title": "Reopen Thread",
+        "icon": "$(debug-restart)"
       },
       {
         "command": "piSelection.reviewChanges",
@@ -81,51 +105,87 @@
       "explorer": [
         {
           "id": "piSelection.sessions",
-          "name": "Pi Sessions"
+          "name": "Pi Threads"
         }
       ]
     },
     "menus": {
+      "commandPalette": [
+        { "command": "piSelection.openSession", "when": "false" },
+        { "command": "piSelection.abort", "when": "false" },
+        { "command": "piSelection.reply", "when": "false" },
+        { "command": "piSelection.markReviewed", "when": "false" },
+        { "command": "piSelection.revealThread", "when": "false" },
+        { "command": "piSelection.replyThread", "when": "false" },
+        { "command": "piSelection.settleThread", "when": "false" },
+        { "command": "piSelection.reopenThread", "when": "false" },
+        { "command": "piSelection.reviewChanges", "when": "false" }
+      ],
       "view/title": [
         {
-          "command": "piSelection.openParent",
+          "command": "piSelection.submit",
           "when": "view == piSelection.sessions",
           "group": "navigation@1"
         },
         {
-          "command": "piSelection.clearCompleted",
+          "command": "piSelection.openParent",
           "when": "view == piSelection.sessions",
           "group": "navigation@2"
         }
       ],
       "view/item/context": [
         {
-          "command": "piSelection.openSession",
-          "when": "view == piSelection.sessions && viewItem == piSelection.finished",
+          "command": "piSelection.replyThread",
+          "when": "view == piSelection.sessions && viewItem =~ /piSelection\\.thread.*\\.canReply/",
           "group": "inline@1"
         },
         {
+          "command": "piSelection.settleThread",
+          "when": "view == piSelection.sessions && viewItem =~ /piSelection\\.thread.*\\.canSettle/",
+          "group": "inline@2"
+        },
+        {
+          "command": "piSelection.reopenThread",
+          "when": "view == piSelection.sessions && viewItem =~ /piSelection\\.thread.*\\.settled/",
+          "group": "inline@2"
+        },
+        {
           "command": "piSelection.abort",
-          "when": "view == piSelection.sessions && viewItem == piSelection.running",
-          "group": "inline@1"
+          "when": "view == piSelection.sessions && viewItem =~ /piSelection\\.thread.*\\.canAbort/",
+          "group": "inline@2"
+        },
+        {
+          "command": "piSelection.reviewChanges",
+          "when": "view == piSelection.sessions && viewItem =~ /piSelection\\.thread.*\\.hasChanges/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "piSelection.openSession",
+          "when": "view == piSelection.sessions && viewItem =~ /piSelection\\.thread.*\\.canReply/",
+          "group": "navigation@2"
         }
       ],
       "comments/commentThread/context": [
         {
           "command": "piSelection.reply",
-          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionThread) || (commentController == piSelection.agentation && commentThread == piSelection.agentationReview)",
+          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionThread) || (commentController == piSelection.agentation && (commentThread == piSelection.agentationNeedsAttention || commentThread == piSelection.agentationLegacy))",
           "group": "inline"
         }
       ],
       "comments/commentThread/title": [
         {
           "command": "piSelection.reviewChanges",
-          "when": "commentController == piSelection.agentation && commentThread == piSelection.agentationReview",
+          "when": "commentController == piSelection.agentation",
           "group": "inline@1"
         },
         {
           "command": "piSelection.markReviewed",
-          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionThread) || (commentController == piSelection.agentation && commentThread == piSelection.agentationReview)",
+          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionThread) || (commentController == piSelection.agentation && commentThread == piSelection.agentationNeedsAttention)",
+          "group": "inline@2"
+        },
+        {
+          "command": "piSelection.reopenThread",
+          "when": "(commentController == piSelection.selection && commentThread == piSelection.selectionReviewed) || (commentController == piSelection.agentation && commentThread == piSelection.agentationSettled)",
           "group": "inline@2"
         }
       ],

@@ -20,71 +20,87 @@ import {
   Utf8LruCache,
 } from "./review-content";
 import { SessionInlays } from "./session-inlays";
+import { isSelectionReplyable } from "./selection-thread-model";
 import { SelectionThreads } from "./selection-threads";
 import { exactReviewPath, isExactReviewPathContained } from "./source-file";
 import { PI_SELECTION_SYSTEM_PROMPT } from "./system-prompt";
+import {
+  canSettleThread,
+  deriveThreadLifecycle,
+  groupThreadSummaries,
+  serializeThreadRef,
+  supportsThreadSettlement,
+  type ThreadGroup,
+  type ThreadSummary,
+} from "./thread-model";
 
-class SessionTree implements vscode.TreeDataProvider<PiJob> {
-  private readonly changed = new vscode.EventEmitter<PiJob | undefined>();
+type ThreadInboxNode = ThreadGroup | ThreadSummary;
+
+class ThreadInbox implements vscode.TreeDataProvider<ThreadInboxNode> {
+  private readonly changed = new vscode.EventEmitter<ThreadInboxNode | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
 
-  constructor(
-    private readonly coordinators: Map<string, PiCoordinator>,
-    private readonly projectedJobs: () => PiJob[],
-    private readonly projectedHasChanges: (job: PiJob) => boolean,
-  ) {}
+  constructor(private readonly summaries: () => ThreadSummary[]) {}
 
   refresh(): void {
     this.changed.fire(undefined);
   }
 
-  getChildren(): PiJob[] {
-    return [
-      ...this.projectedJobs(),
-      ...[...this.coordinators.values()].flatMap((coordinator) => [...coordinator.list()]),
-    ];
+  attentionCount(): number {
+    return this.summaries().filter(({ lifecycle }) => lifecycle === "needsAttention").length;
   }
 
-  getTreeItem(job: PiJob): vscode.TreeItem {
-    const item = new vscode.TreeItem(job.name, vscode.TreeItemCollapsibleState.None);
-    item.description = `${job.file} · ${job.detail}`;
-    item.contextValue = job.projected
-      ? "piSelection.projected"
-      : ["queued", "running"].includes(job.status)
-        ? "piSelection.running"
-        : "piSelection.finished";
+  getChildren(element?: ThreadInboxNode): ThreadInboxNode[] {
+    if (!element) return groupThreadSummaries(this.summaries());
+    return "threads" in element ? element.threads : [];
+  }
+
+  getTreeItem(node: ThreadInboxNode): vscode.TreeItem {
+    if ("threads" in node) {
+      const labels = {
+        needsAttention: "Needs attention",
+        working: "Working",
+        settled: "Settled",
+      } as const;
+      const item = new vscode.TreeItem(
+        `${labels[node.lifecycle]} (${node.threads.length})`,
+        node.lifecycle === "settled"
+          ? vscode.TreeItemCollapsibleState.Collapsed
+          : vscode.TreeItemCollapsibleState.Expanded,
+      );
+      item.contextValue = `piSelection.threadGroup.${node.lifecycle}`;
+      return item;
+    }
+
+    const item = new vscode.TreeItem(node.title, vscode.TreeItemCollapsibleState.None);
+    item.id = serializeThreadRef(node.ref);
+    item.description = `${node.location} · ${node.latestUpdate}`;
+    item.contextValue = [
+      "piSelection.thread",
+      node.ref.kind,
+      node.lifecycle,
+      node.canReply ? "canReply" : "noReply",
+      node.canSettle ? "canSettle" : "noSettle",
+      node.canAbort ? "canAbort" : "noAbort",
+      node.hasChanges ? "hasChanges" : "noChanges",
+    ].join(".");
     item.iconPath = new vscode.ThemeIcon(
-      job.status === "queued" || job.status === "running"
+      node.lifecycle === "working"
         ? "loading~spin"
-        : job.status === "completed"
-          ? "pass"
-          : job.status === "aborted"
-            ? "circle-slash"
-            : "error",
+        : node.lifecycle === "needsAttention"
+          ? "bell-dot"
+          : "pass",
     );
     item.tooltip = new vscode.MarkdownString(
-      [
-        `**${job.name}**`,
-        `${job.file} — ${job.detail}`,
-        job.error,
-        job.response ? `---\n\n${job.response}` : undefined,
-      ]
+      [`**${node.title}**`, `${node.location} — ${node.latestUpdate}`, node.capabilityMessage]
         .filter((line) => line !== undefined)
         .join("\n\n"),
     );
-    if (job.projected && this.projectedHasChanges(job)) {
-      item.command = {
-        command: "piSelection.reviewChanges",
-        title: "Review Changes",
-        arguments: [job],
-      };
-    } else if (job.sessionFile && !["queued", "running"].includes(job.status)) {
-      item.command = {
-        command: "piSelection.openSession",
-        title: "Open Pi Session",
-        arguments: [job],
-      };
-    }
+    item.command = {
+      command: "piSelection.revealThread",
+      title: "Reveal Thread",
+      arguments: [node],
+    };
     return item;
   }
 }
@@ -351,40 +367,110 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const coordinators = new Map<string, PiCoordinator>();
   const output = vscode.window.createOutputChannel("Pi Selection");
   const inlays = new SessionInlays();
+  let refreshInbox = (): void => {};
   const selectionThreads = new SelectionThreads(
     context.extensionUri,
     context.workspaceState,
     (message) => output.appendLine(message),
+    () => refreshInbox(),
   );
   const pendingReplyIds = new PendingReplyIds<vscode.CommentThread>();
   const feeds = new Map<string, { job: PiJob; quickPick: vscode.QuickPick<vscode.QuickPickItem> }>();
+  const agentationServerUrl = (): string =>
+    vscode.workspace
+      .getConfiguration("piSelection")
+      .get("agentationServerUrl", "http://127.0.0.1:4748");
   let projection: ProjectionController;
-  const tree = new SessionTree(
-    coordinators,
-    () => projection?.list() ?? [],
-    (job) => projection?.hasChanges(job) ?? false,
-  );
+  const tree = new ThreadInbox(() => [
+    ...selectionThreads.listThreads().map(({ job, id, title, location, updatedAt, settled }) => {
+      const ref = { kind: "local" as const, id };
+      return {
+        ref,
+        title,
+        source: "local" as const,
+        location,
+        lifecycle: deriveThreadLifecycle(job.status, settled),
+        execution: job.status,
+        updatedAt,
+        latestUpdate: job.latestUpdate,
+        canReply: isSelectionReplyable(job),
+        canSettle: canSettleThread(ref, job.status, settled),
+        canAbort: job.status === "queued" || job.status === "running",
+        hasChanges: false,
+        settlementCapability: true,
+      };
+    }),
+    ...(projection?.listThreads() ?? []).map((view) => {
+      const ref = {
+        kind: "agentation" as const,
+        serverUrl: agentationServerUrl(),
+        taskId: view.taskId,
+      };
+      const settlementCapability = supportsThreadSettlement(
+        ref,
+        view.settled,
+        view.settlementCapability,
+      );
+      return {
+        ref,
+        title: view.title,
+        source: "agentation" as const,
+        location: view.location,
+        lifecycle: deriveThreadLifecycle(view.status, view.settled),
+        execution: view.status,
+        updatedAt: view.updatedAt,
+        latestUpdate: view.job.latestUpdate,
+        canReply:
+          Boolean(view.job.sessionFile) &&
+          view.status !== "queued" &&
+          view.status !== "running",
+        canSettle: canSettleThread(
+          ref,
+          view.status,
+          view.settled,
+          view.settlementCapability,
+        ),
+        canAbort: false,
+        hasChanges: view.hasChanges,
+        settlementCapability,
+        capabilityMessage: settlementCapability
+          ? undefined
+          : "Agentation server update required to settle this thread.",
+      };
+    }),
+  ]);
+  refreshInbox = () => tree.refresh();
   projection = new ProjectionController(
     context.extensionUri,
     inlays,
     () => {
-      tree.refresh();
+      refreshInbox();
       for (const feed of feeds.values()) refreshFeed(feed.job, feed.quickPick);
     },
     (message) => output.appendLine(message),
   );
+  const treeView = vscode.window.createTreeView("piSelection.sessions", { treeDataProvider: tree });
+  let projectionConnection: "connecting" | "connected" | "disconnected" = "connecting";
+  refreshInbox = () => {
+    tree.refresh();
+    const attention = tree.attentionCount();
+    treeView.badge = {
+      value: attention,
+      tooltip: `${attention} thread${attention === 1 ? "" : "s"} need attention · Agentation ${projectionConnection}`,
+    };
+  };
   const terminals = new Map<string, vscode.Terminal>();
   const terminalCreations = new Map<string, Promise<vscode.Terminal>>();
   let projectionClient: AgentationProjectionClient | undefined;
   const projectionContent = new ProjectionContentProvider(() => projectionClient);
   const connectProjection = (): void => {
     projectionClient?.dispose();
-    const serverUrl = vscode.workspace
-      .getConfiguration("piSelection")
-      .get("agentationServerUrl", "http://127.0.0.1:4748");
+    projectionConnection = "connecting";
+    projection.disconnect();
     projectionClient = new AgentationProjectionClient(
-      serverUrl,
+      agentationServerUrl(),
       (event) => {
+        projectionConnection = "connected";
         if (event.type === "projection.reset") {
           projectionContent.reset(event.generation);
           for (const feed of feeds.values()) {
@@ -402,12 +488,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
         }
         projection.handle(event);
+        refreshInbox();
       },
-      (message) => output.appendLine(`[Agentation] ${message}`),
+      (message) => {
+        projectionConnection = "disconnected";
+        output.appendLine(`[Agentation] ${message}`);
+        refreshInbox();
+      },
     );
   };
   connectProjection();
-  const treeRegistration = vscode.window.registerTreeDataProvider("piSelection.sessions", tree);
+  refreshInbox();
   const inlayRegistration = vscode.languages.registerInlayHintsProvider({ scheme: "file" }, inlays);
   const projectionContentRegistration = vscode.workspace.registerTextDocumentContentProvider(
     PROJECTION_SCHEME,
@@ -548,13 +639,107 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     quickPick.show();
   };
 
+  const agentationRef = (
+    taskId: string,
+  ): Extract<ThreadSummary["ref"], { kind: "agentation" }> => ({
+    kind: "agentation",
+    serverUrl: agentationServerUrl(),
+    taskId,
+  });
+
+  const assertCurrentAgentationRef = (
+    ref: Extract<ThreadSummary["ref"], { kind: "agentation" }>,
+  ): void => {
+    if (ref.serverUrl !== agentationServerUrl()) {
+      throw new Error("This thread belongs to a different Agentation server.");
+    }
+  };
+
+  const jobForThread = (thread: ThreadSummary): PiJob | undefined => {
+    if (thread.ref.kind === "local") return selectionThreads.findJob(thread.ref.id);
+    assertCurrentAgentationRef(thread.ref);
+    const taskId = thread.ref.taskId;
+    return projection.listThreads().find((view) => view.taskId === taskId)?.job;
+  };
+
+  const updateAgentationSettlement = async (
+    ref: Extract<ThreadSummary["ref"], { kind: "agentation" }>,
+    settled: boolean,
+  ): Promise<void> => {
+    assertCurrentAgentationRef(ref);
+    const target = projection.settlementTarget(ref.taskId);
+    if (!target) {
+      throw new Error("Agentation server update required to change settlement state.");
+    }
+    if (target.settled === settled) return;
+    const client = projectionClient;
+    if (!client) throw new Error("Agentation projection client is not connected.");
+    projection.assertSettlementTarget(target);
+    const snapshot = await client.postProjectionSettlement(
+      target.generation,
+      target.incarnationId,
+      target.taskId,
+      target.revision,
+      settled,
+    );
+    assertCurrentAgentationRef(ref);
+    projection.assertGeneration(target.generation);
+    const current = projection.snapshotByTaskId(target.taskId);
+    if (
+      current?.incarnationId !== target.incarnationId ||
+      snapshot.taskId !== target.taskId ||
+      snapshot.incarnationId !== target.incarnationId ||
+      snapshot.settled !== settled ||
+      snapshot.revision <= target.revision
+    ) {
+      throw new Error("Agentation returned an invalid settlement snapshot.");
+    }
+    projection.applySettlement(snapshot);
+  };
+
+  const replyToThread = async (thread?: ThreadSummary): Promise<void> => {
+    if (!thread?.ref) return;
+    const text = await vscode.window.showInputBox({
+      title: `Reply: ${thread.title}`,
+      placeHolder: "Ask Pi to follow up…",
+      ignoreFocusOut: true,
+    });
+    if (!text?.trim()) return;
+    if (thread.ref.kind === "local") {
+      const job = selectionThreads.findJob(thread.ref.id);
+      const coordinator = job ? coordinators.get(job.cwd) : undefined;
+      if (!job || !coordinator) throw new Error("The Pi selection session is no longer available.");
+      selectionThreads.reopen(job);
+      coordinator.reply(job, text.trim());
+      return;
+    }
+    const ref = thread.ref;
+    assertCurrentAgentationRef(ref);
+    const target = await projection.replyTargetForTask(ref.taskId);
+    if (!target) throw new Error("This Agentation thread is not ready for replies.");
+    const client = projectionClient;
+    if (!client) throw new Error("Agentation projection client is not connected.");
+    projection.assertGeneration(target.generation);
+    await client.postProjectionReply(
+      target.generation,
+      target.taskId,
+      target.annotationId,
+      text.trim(),
+      randomUUID(),
+      () => {
+        assertCurrentAgentationRef(ref);
+        projection.assertGeneration(target.generation);
+      },
+    );
+  };
+
   context.subscriptions.push(
     output,
     inlays,
     selectionThreads,
     projection,
     projectionContent,
-    treeRegistration,
+    treeView,
     inlayRegistration,
     projectionContentRegistration,
     vscode.workspace.onDidChangeConfiguration((event) => {
@@ -635,13 +820,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const job = inlays.find(jobId);
       if (job) showFeed(job);
     }),
-    vscode.commands.registerCommand("piSelection.openSession", (job: PiJob) => {
-      if (job.sessionFile) {
+    vscode.commands.registerCommand("piSelection.openSession", (target?: PiJob | ThreadSummary) => {
+      if (!target) return;
+      const job = "ref" in target ? jobForThread(target) : target;
+      if (job?.sessionFile) {
         void openSession(job.sessionFile, `Pi: ${job.name}`, job.cwd, job.projected);
       }
     }),
-    vscode.commands.registerCommand("piSelection.markReviewed", (thread: vscode.CommentThread) => {
-      if (!selectionThreads.markReviewed(thread)) projection.markReviewed(thread);
+    vscode.commands.registerCommand("piSelection.revealThread", async (thread?: ThreadSummary) => {
+      if (!thread?.ref) return;
+      if (thread.ref.kind === "local") {
+        await selectionThreads.reveal(thread.ref.id);
+      } else {
+        assertCurrentAgentationRef(thread.ref);
+        if (await projection.revealTask(thread.ref.taskId)) return;
+        const job = jobForThread(thread);
+        if (job) showFeed(job);
+      }
+    }),
+    vscode.commands.registerCommand("piSelection.replyThread", replyToThread),
+    vscode.commands.registerCommand("piSelection.settleThread", async (thread?: ThreadSummary) => {
+      if (!thread?.ref) return;
+      if (thread.ref.kind === "local") {
+        if (!selectionThreads.settle(thread.ref.id)) throw new Error("This thread is not ready to settle.");
+      } else {
+        await updateAgentationSettlement(thread.ref, true);
+      }
+      tree.refresh();
+    }),
+    vscode.commands.registerCommand(
+      "piSelection.reopenThread",
+      async (target?: ThreadSummary | vscode.CommentThread) => {
+        if (!target) return;
+        if ("ref" in target) {
+          if (target.ref.kind === "local") selectionThreads.reopen(target.ref.id);
+          else await updateAgentationSettlement(target.ref, false);
+        } else if (!selectionThreads.reopenComment(target)) {
+          const taskId = projection.taskIdForThread(target);
+          if (taskId) await updateAgentationSettlement(agentationRef(taskId), false);
+        }
+        tree.refresh();
+      },
+    ),
+    vscode.commands.registerCommand("piSelection.markReviewed", async (thread: vscode.CommentThread) => {
+      if (selectionThreads.markReviewed(thread)) {
+        tree.refresh();
+        return;
+      }
+      const target = projection.markReviewed(thread);
+      if (!target) throw new Error("This thread cannot be settled.");
+      await updateAgentationSettlement(agentationRef(target.taskId), true);
     }),
     vscode.commands.registerCommand("piSelection.reply", async (reply: vscode.CommentReply) => {
       if (!reply.text.trim()) throw new Error("Enter a reply before submitting.");
@@ -649,6 +877,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (selectionJob) {
         const coordinator = coordinators.get(selectionJob.cwd);
         if (!coordinator) throw new Error("The Pi selection session is no longer available.");
+        selectionThreads.reopen(selectionJob);
         coordinator.reply(selectionJob, reply.text);
         return;
       }
@@ -671,7 +900,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       pendingReplyIds.confirm(reply.thread, reply.text, requestId);
     }),
     vscode.commands.registerCommand("piSelection.reviewChanges", async (target: unknown) => {
-      const snapshot = projection.snapshotFor(target);
+      const resolved =
+        target && typeof target === "object" && "ref" in target
+          ? jobForThread(target as ThreadSummary)
+          : target;
+      const snapshot = projection.snapshotFor(resolved);
       if (!snapshot?.changes?.length) {
         void vscode.window.showInformationMessage("This task has no projected changes.");
         return;
@@ -744,7 +977,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
       }
     }),
-    vscode.commands.registerCommand("piSelection.abort", async (job: PiJob) => {
+    vscode.commands.registerCommand("piSelection.abort", async (target?: PiJob | ThreadSummary) => {
+      if (!target) return;
+      const job = "ref" in target ? jobForThread(target) : target;
+      if (!job) return;
       const coordinator = [...coordinators.values()].find((candidate) => candidate.list().includes(job));
       await coordinator?.abort(job);
     }),
@@ -766,9 +1002,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     vscode.commands.registerCommand("piSelection.clearCompleted", () => {
-      selectionThreads.removeFinished();
-      for (const coordinator of coordinators.values()) coordinator.clearFinished();
-      inlays.removeFinished();
+      const removed = selectionThreads.removeSettled();
+      for (const coordinator of coordinators.values()) coordinator.removeJobs(removed);
+      for (const jobId of removed) inlays.remove(jobId);
     }),
   );
 }

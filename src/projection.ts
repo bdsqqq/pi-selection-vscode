@@ -14,6 +14,7 @@ import { jobName, type PiJob } from "./coordinator";
 import { latestUpdate } from "./inlay-text";
 import { projectThreadItems } from "./projection-comments";
 import { SessionInlays } from "./session-inlays";
+import { preferredSelectionStatus } from "./selection-thread-model";
 import {
   chooseSourcePath,
   isPathWithinRoot,
@@ -31,7 +32,6 @@ type ProjectedReview = {
   progress: vscode.Comment;
   uri: vscode.Uri;
   offset: number;
-  reviewed: boolean;
 };
 
 type ProjectedTask = {
@@ -48,6 +48,28 @@ export type ProjectionReplyTarget = {
   generation: string;
   taskId: string;
   annotationId: string;
+};
+
+export type ProjectionSettlementTarget = {
+  generation: string;
+  taskId: string;
+  revision: number;
+  settled: boolean;
+  incarnationId: string;
+};
+
+export type ProjectedThreadView = {
+  taskId: string;
+  job: PiJob;
+  title: string;
+  location: string;
+  updatedAt: number;
+  settled?: boolean;
+  settlementCapability: boolean;
+  revision: number;
+  status: AgentationSnapshot["status"];
+  hasChanges: boolean;
+  anchorCount: number;
 };
 
 export class ProjectionController implements vscode.Disposable {
@@ -94,6 +116,25 @@ export class ProjectionController implements vscode.Disposable {
     return [...this.tasks.values()].map(({ job }) => job);
   }
 
+  listThreads(): ProjectedThreadView[] {
+    return [...this.tasks.values()].map((task) => {
+      const snapshot = task.state.snapshot;
+      return {
+        taskId: task.id,
+        job: task.job,
+        title: task.job.name,
+        location: task.job.file,
+        updatedAt: snapshot.updatedAt ?? 0,
+        settled: snapshot.settled,
+        settlementCapability: hasSettlementCapability(snapshot),
+        revision: snapshot.revision,
+        status: snapshot.status,
+        hasChanges: Boolean(snapshot.changes?.length),
+        anchorCount: task.reviews.size,
+      };
+    });
+  }
+
   snapshotByTaskId(taskId: string): AgentationSnapshot | undefined {
     return this.tasks.get(taskId)?.state.snapshot;
   }
@@ -113,6 +154,68 @@ export class ProjectionController implements vscode.Disposable {
 
   hasChanges(job: PiJob): boolean {
     return Boolean(this.snapshotFor(job)?.changes?.length);
+  }
+
+  taskIdForThread(thread: vscode.CommentThread): string | undefined {
+    return this.reviews.get(thread)?.taskId;
+  }
+
+  settlementTarget(taskId: string): ProjectionSettlementTarget | undefined {
+    if (!this.generation) return undefined;
+    const snapshot = this.tasks.get(taskId)?.state.snapshot;
+    if (!snapshot || !isTerminal(snapshot) || !hasSettlementCapability(snapshot)) return undefined;
+    return {
+      generation: this.generation,
+      taskId,
+      revision: snapshot.revision,
+      settled: snapshot.settled,
+      incarnationId: snapshot.incarnationId,
+    };
+  }
+
+  assertGeneration(generation: string): void {
+    if (!this.generation || this.generation !== generation) {
+      throw new Error("This Agentation projection generation expired. Refresh and try again.");
+    }
+  }
+
+  assertSettlementTarget(target: ProjectionSettlementTarget): void {
+    const current = this.settlementTarget(target.taskId);
+    if (
+      !current ||
+      current.generation !== target.generation ||
+      current.revision !== target.revision ||
+      current.settled !== target.settled ||
+      current.incarnationId !== target.incarnationId
+    ) {
+      throw new Error("This settlement target expired. Refresh the review and try again.");
+    }
+  }
+
+  applySettlement(snapshot: AgentationSnapshot): void {
+    this.handle(snapshot);
+  }
+
+  async replyTargetForTask(taskId: string): Promise<ProjectionReplyTarget | undefined> {
+    if (!this.generation) return undefined;
+    const snapshot = this.tasks.get(taskId)?.state.snapshot;
+    if (!snapshot || !isReplyable(snapshot)) return undefined;
+    const annotation =
+      snapshot.annotations.length === 1
+        ? snapshot.annotations[0]
+        : (
+            await vscode.window.showQuickPick(
+              snapshot.annotations.map((candidate) => ({
+                label: jobName(candidate.comment),
+                description: candidate.sourceFile,
+                annotation: candidate,
+              })),
+              { title: "Reply to Agentation thread", placeHolder: "Choose an annotation" },
+            )
+          )?.annotation;
+    return annotation
+      ? { generation: this.generation, taskId, annotationId: annotation.id }
+      : undefined;
   }
 
   replyTarget(thread: vscode.CommentThread): ProjectionReplyTarget | undefined {
@@ -177,13 +280,44 @@ export class ProjectionController implements vscode.Disposable {
     this.refreshProjectionViews();
   }
 
-  markReviewed(thread: vscode.CommentThread): void {
-    const review = this.reviews.get(thread);
-    if (!review || review.reviewed) return;
-    review.reviewed = true;
-    review.thread.state = vscode.CommentThreadState.Resolved;
-    review.thread.contextValue = "piSelection.reviewed";
-    this.refreshDecorations();
+  disconnect(): void {
+    this.generation = undefined;
+    this.reset();
+  }
+
+  markReviewed(thread: vscode.CommentThread): ProjectionSettlementTarget | undefined {
+    const taskId = this.taskIdForThread(thread);
+    return taskId ? this.settlementTarget(taskId) : undefined;
+  }
+
+  async revealTask(taskId: string): Promise<boolean> {
+    const reviews = [...(this.tasks.get(taskId)?.reviews.values() ?? [])].sort((left, right) =>
+      `${left.job.file}\0${left.annotationId}`.localeCompare(`${right.job.file}\0${right.annotationId}`),
+    );
+    if (reviews.length === 0) return false;
+
+    const review =
+      reviews.length === 1
+        ? reviews[0]
+        : (
+            await vscode.window.showQuickPick(
+              reviews.map((candidate) => ({
+                label: candidate.job.name,
+                description: candidate.job.file,
+                review: candidate,
+              })),
+              { title: "Reveal Agentation review", placeHolder: "Select a source anchor" },
+            )
+          )?.review;
+    if (!review) return false;
+
+    const document = await vscode.workspace.openTextDocument(review.uri);
+    const position = document.positionAt(Math.min(review.offset, document.getText().length));
+    const range = document.lineAt(position.line).range;
+    review.thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+    const editor = await vscode.window.showTextDocument(document, { preview: true, selection: range });
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    return true;
   }
 
   dispose(): void {
@@ -286,9 +420,8 @@ export class ProjectionController implements vscode.Disposable {
         [...staticComments(annotation, task.state.snapshot.messages), progress],
       );
       thread.label = `Agentation: ${jobName(annotation.comment)}`;
-      thread.contextValue = "piSelection.agentationReview";
-      thread.state = vscode.CommentThreadState.Unresolved;
-      thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+      applyThreadSettlement(thread, task.state.snapshot);
+      thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
       thread.canReply = isReplyable(task.state.snapshot);
 
       const job = createAnchorJob(task, annotation, key, resolved);
@@ -302,7 +435,6 @@ export class ProjectionController implements vscode.Disposable {
         progress,
         uri: document.uri,
         offset: document.offsetAt(position),
-        reviewed: false,
       };
       task.reviews.set(key, review);
       this.reviews.set(thread, review);
@@ -326,6 +458,7 @@ export class ProjectionController implements vscode.Disposable {
       ...staticComments(annotation, snapshot.messages),
       review.progress,
     ];
+    applyThreadSettlement(review.thread, snapshot);
     review.thread.canReply = isReplyable(snapshot);
   }
 
@@ -357,24 +490,31 @@ export class ProjectionController implements vscode.Disposable {
       failed: this.failedGutterDecoration,
     } as const;
     for (const editor of vscode.window.visibleTextEditors) {
-      const unresolved: vscode.Range[] = [];
+      const byLine = new Map<
+        number,
+        { range: vscode.Range; status: AgentationSnapshot["status"] }
+      >();
+      for (const review of this.reviews.values()) {
+        if (review.uri.toString() !== editor.document.uri.toString()) continue;
+        const snapshot = this.tasks.get(review.taskId)?.state.snapshot;
+        if (!snapshot || isCanonicallySettled(snapshot)) continue;
+        const position = editor.document.positionAt(
+          Math.min(review.offset, editor.document.getText().length),
+        );
+        const range = editor.document.lineAt(position.line).range;
+        byLine.set(position.line, {
+          range,
+          status: preferredSelectionStatus(byLine.get(position.line)?.status, snapshot.status),
+        });
+      }
       const byStatus: Record<AgentationSnapshot["status"], vscode.Range[]> = {
         queued: [],
         running: [],
         completed: [],
         failed: [],
       };
-      for (const review of this.reviews.values()) {
-        if (review.uri.toString() !== editor.document.uri.toString()) continue;
-        const position = editor.document.positionAt(
-          Math.min(review.offset, editor.document.getText().length),
-        );
-        const range = editor.document.lineAt(position.line).range;
-        const status = this.tasks.get(review.taskId)?.state.snapshot.status;
-        if (status) byStatus[status].push(range);
-        if (!review.reviewed) unresolved.push(range);
-      }
-      editor.setDecorations(this.decoration, unresolved);
+      for (const { range, status } of byLine.values()) byStatus[status].push(range);
+      editor.setDecorations(this.decoration, [...byLine.values()].map(({ range }) => range));
       for (const status of ["queued", "running", "completed", "failed"] as const) {
         editor.setDecorations(gutterDecorations[status], byStatus[status]);
       }
@@ -552,6 +692,47 @@ function progressBody(snapshot: AgentationSnapshot): vscode.MarkdownString {
     body.appendText(snapshot.error);
   }
   return body;
+}
+
+type SettlementCapableSnapshot = AgentationSnapshot & {
+  settled: boolean;
+  incarnationId: string;
+};
+
+function hasSettlementCapability(
+  snapshot: AgentationSnapshot,
+): snapshot is SettlementCapableSnapshot {
+  return typeof snapshot.settled === "boolean" && typeof snapshot.incarnationId === "string";
+}
+
+function isTerminal(snapshot: AgentationSnapshot): boolean {
+  return snapshot.status === "completed" || snapshot.status === "failed";
+}
+
+function isCanonicallySettled(snapshot: AgentationSnapshot): boolean {
+  return hasSettlementCapability(snapshot) && snapshot.settled;
+}
+
+function applyThreadSettlement(
+  thread: vscode.CommentThread,
+  snapshot: AgentationSnapshot,
+): void {
+  thread.state = vscode.CommentThreadState.Unresolved;
+  if (!isTerminal(snapshot)) {
+    thread.contextValue = "piSelection.agentationWorking";
+    return;
+  }
+  if (!hasSettlementCapability(snapshot)) {
+    thread.contextValue = "piSelection.agentationLegacy";
+    return;
+  }
+  if (!snapshot.settled) {
+    thread.contextValue = "piSelection.agentationNeedsAttention";
+    return;
+  }
+  thread.state = vscode.CommentThreadState.Resolved;
+  thread.contextValue = "piSelection.agentationSettled";
+  thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
 }
 
 function isReplyable(snapshot: AgentationSnapshot): boolean {

@@ -46,6 +46,17 @@ export type RestoredSelectionView = {
   position: vscode.Position;
 };
 
+export type LocalThreadView = {
+  job: PiJob;
+  id: string;
+  title: string;
+  location: string;
+  updatedAt: number;
+  settled: boolean;
+  uri: vscode.Uri;
+  range: vscode.Range;
+};
+
 type RestoredSelection = {
   id: string;
   request: SelectionRequest;
@@ -76,6 +87,7 @@ export class SelectionThreads implements vscode.Disposable {
     extensionUri: vscode.Uri,
     private readonly workspaceState: vscode.Memento,
     private readonly log: (message: string) => void,
+    private readonly onChange: () => void,
   ) {
     this.comments.options = {
       prompt: "Reply to this Pi session",
@@ -115,6 +127,7 @@ export class SelectionThreads implements vscode.Disposable {
       endOffset,
     });
     this.schedulePersistence();
+    this.onChange();
     return thread;
   }
 
@@ -133,6 +146,7 @@ export class SelectionThreads implements vscode.Disposable {
       }
     }
     await this.flush();
+    this.onChange();
     return views;
   }
 
@@ -158,10 +172,69 @@ export class SelectionThreads implements vscode.Disposable {
         ...progressComments(selection.job, selection.progressComment),
       ];
       selection.thread.label = `Pi: ${selection.job.name}`;
+      applySelectionThreadState(selection.thread, selection.job, selection.reviewed);
       selection.thread.canReply = isSelectionReplyable(selection.job);
     }
     this.refreshDecorations();
     this.schedulePersistence();
+    this.onChange();
+  }
+
+  listThreads(): LocalThreadView[] {
+    return [...this.selections.values()].map((selection) => {
+      const range = selection.thread.range ?? selectionRange(selection);
+      return {
+        job: selection.job,
+        id: selection.id,
+        title: selection.job.name,
+        location: `${selection.request.relativeFile}:${range.start.line + 1}-${range.end.line + 1}`,
+        updatedAt: selection.updatedAt,
+        settled: selection.reviewed,
+        uri: vscode.Uri.parse(selection.uri, true),
+        range,
+      };
+    });
+  }
+
+  findJob(id: string): PiJob | undefined {
+    return this.findSelection(id)?.job;
+  }
+
+  settle(target: string | PiJob): boolean {
+    const selection = this.findSelection(typeof target === "string" ? target : target.id);
+    if (!selection || selection.reviewed || !isTerminal(selection.job)) return false;
+    selection.reviewed = true;
+    selection.updatedAt = Date.now();
+    applySelectionThreadState(selection.thread, selection.job, true);
+    selection.thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
+    this.refreshDecorations();
+    this.schedulePersistence();
+    this.onChange();
+    return true;
+  }
+
+  reopen(target: string | PiJob): boolean {
+    const selection = this.findSelection(typeof target === "string" ? target : target.id);
+    if (!selection || !selection.reviewed) return false;
+    selection.reviewed = false;
+    selection.updatedAt = Date.now();
+    applySelectionThreadState(selection.thread, selection.job, false);
+    this.refreshDecorations();
+    this.schedulePersistence();
+    this.onChange();
+    return true;
+  }
+
+  async reveal(id: string): Promise<void> {
+    const selection = this.findSelection(id);
+    if (!selection) return;
+    const range = selection.thread.range ?? selectionRange(selection);
+    const editor = await vscode.window.showTextDocument(vscode.Uri.parse(selection.uri, true), {
+      preview: true,
+      selection: range,
+    });
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    selection.thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
   }
 
   replyTarget(thread: vscode.CommentThread): PiJob | undefined {
@@ -171,24 +244,26 @@ export class SelectionThreads implements vscode.Disposable {
 
   markReviewed(thread: vscode.CommentThread): boolean {
     const selection = this.selections.get(thread);
-    if (!selection || selection.reviewed) return false;
-    selection.reviewed = true;
-    selection.updatedAt = Date.now();
-    selection.thread.state = vscode.CommentThreadState.Resolved;
-    selection.thread.contextValue = "piSelection.selectionReviewed";
-    this.refreshDecorations();
-    this.schedulePersistence();
-    return true;
+    return selection ? this.settle(selection.id) : false;
   }
 
-  removeFinished(): void {
+  reopenComment(thread: vscode.CommentThread): boolean {
+    const selection = this.selections.get(thread);
+    return selection ? this.reopen(selection.id) : false;
+  }
+
+  removeSettled(): string[] {
+    const removed: string[] = [];
     for (const selection of [...this.selections.values()]) {
-      if (selection.job.status === "queued" || selection.job.status === "running") continue;
+      if (!selection.reviewed) continue;
+      removed.push(selection.job.id);
       this.selections.delete(selection.thread);
       selection.thread.dispose();
     }
     this.refreshDecorations();
     this.schedulePersistence();
+    this.onChange();
+    return removed;
   }
 
   dispose(): void {
@@ -199,6 +274,13 @@ export class SelectionThreads implements vscode.Disposable {
     this.selections.clear();
     this.comments.dispose();
     for (const decoration of Object.values(this.gutterDecorations)) decoration.dispose();
+  }
+
+  private findSelection(id: string): TrackedSelection | undefined {
+    for (const selection of this.selections.values()) {
+      if (selection.id === id || selection.job.id === id) return selection;
+    }
+    return undefined;
   }
 
   private trackDocumentEdit(event: vscode.TextDocumentChangeEvent): void {
@@ -213,7 +295,6 @@ export class SelectionThreads implements vscode.Disposable {
       );
       selection.startOffset = offsets.start;
       selection.endOffset = offsets.end;
-      selection.updatedAt = Date.now();
       selection.fingerprint = selectionFingerprint(
         event.document.getText(),
         offsets.start,
@@ -223,6 +304,7 @@ export class SelectionThreads implements vscode.Disposable {
     }
     this.refreshDecorations();
     this.schedulePersistence();
+    this.onChange();
   }
 
   private createThread(
@@ -246,12 +328,7 @@ export class SelectionThreads implements vscode.Disposable {
       ...progressComments(job, progressComment),
     ]);
     thread.label = `Pi: ${job.name}`;
-    thread.contextValue = restored.reviewed
-      ? "piSelection.selectionReviewed"
-      : "piSelection.selectionThread";
-    thread.state = restored.reviewed
-      ? vscode.CommentThreadState.Resolved
-      : vscode.CommentThreadState.Unresolved;
+    applySelectionThreadState(thread, job, restored.reviewed);
     thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
     thread.canReply = isSelectionReplyable(job);
 
@@ -415,6 +492,17 @@ export class SelectionThreads implements vscode.Disposable {
   }
 }
 
+function isTerminal(job: PiJob): boolean {
+  return job.status !== "queued" && job.status !== "running";
+}
+
+function selectionRange(selection: TrackedSelection): vscode.Range {
+  return new vscode.Range(
+    new vscode.Position(Math.max(0, selection.request.startLine - 1), 0),
+    new vscode.Position(Math.max(0, selection.request.endLine - 1), 0),
+  );
+}
+
 function copyRequest(request: SelectionRequest): SelectionRequest {
   return {
     instruction: request.instruction,
@@ -550,6 +638,21 @@ function renderMessageComment(message: SelectionThreadMessage): vscode.Comment {
     body,
     mode: vscode.CommentMode.Preview,
   };
+}
+
+function applySelectionThreadState(
+  thread: vscode.CommentThread,
+  job: PiJob,
+  settled: boolean,
+): void {
+  thread.state = settled
+    ? vscode.CommentThreadState.Resolved
+    : vscode.CommentThreadState.Unresolved;
+  thread.contextValue = settled
+    ? "piSelection.selectionReviewed"
+    : job.status === "queued" || job.status === "running"
+      ? "piSelection.selectionWorking"
+      : "piSelection.selectionThread";
 }
 
 function progressComments(job: PiJob, comment: vscode.Comment): vscode.Comment[] {

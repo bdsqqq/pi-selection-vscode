@@ -306,6 +306,14 @@ export class PiCoordinator {
     this.changed();
   }
 
+  removeJobs(ids: readonly string[]): void {
+    const wanted = new Set(ids);
+    for (let index = this.jobs.length - 1; index >= 0; index -= 1) {
+      if (wanted.has(this.jobs[index].id)) this.jobs.splice(index, 1);
+    }
+    this.changed();
+  }
+
   dispose(): Promise<void> {
     this.disposePromise ??= this.disposeOperations();
     return this.disposePromise;

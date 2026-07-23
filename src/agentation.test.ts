@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  AgentationProjectionClient,
   assertProjectionReplyResponse,
   parseAgentationEvent,
   parseProjectionRejectionPreparation,
   ProjectionReplyError,
   ProjectionRejectionError,
+  ProjectionSettlementError,
   projectSnapshot,
   projectionContentUrl,
   projectionReplyRequest,
   projectionRejectionAckRequest,
   projectionRejectionPrepareRequest,
+  projectionSettlementRequest,
   sendProjectionReplyWithRetry,
+  sendProjectionSettlementWithRetry,
   SseParser,
   type AgentationSnapshot,
 } from "./agentation";
@@ -28,6 +32,25 @@ test("SseParser flushes a final event when the stream closes", () => {
   const parser = new SseParser();
   assert.deepEqual(parser.push("event: projection\ndata: {\"type\":\"task.snapshot\"}"), []);
   assert.deepEqual(parser.end(), ['{"type":"task.snapshot"}']);
+});
+
+test("projection client reports clean stream EOF before reconnecting", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(new ReadableStream({ start: (controller) => controller.close() }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  let client: AgentationProjectionClient | undefined;
+  try {
+    const disconnected = new Promise<string>((resolve) => {
+      client = new AgentationProjectionClient("http://127.0.0.1:4748", () => {}, resolve);
+    });
+    assert.equal(await disconnected, "agentation projection stream closed");
+  } finally {
+    client?.dispose();
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("projection resets parse strictly and create a fresh snapshot regression boundary", () => {
@@ -114,6 +137,139 @@ test("task snapshots parse messages strictly", () => {
   assert.throws(() =>
     parseAgentationEvent(JSON.stringify({ ...snapshot, messages: [{ id: "message-1", role: "system", body: "no" }] })),
   );
+});
+
+test("task snapshots parse optional settlement and incarnation fields strictly", () => {
+  const snapshot = {
+    type: "task.snapshot",
+    taskId: "task-1",
+    cwd: "/work/app",
+    annotations: [],
+    revision: 1,
+    status: "completed",
+    detail: "completed",
+    settled: true,
+    updatedAt: 1_753_000_000_000,
+    incarnationId: "incarnation-1",
+  };
+  assert.deepEqual(parseAgentationEvent(JSON.stringify(snapshot)), snapshot);
+  assert.throws(() => parseAgentationEvent(JSON.stringify({ ...snapshot, settled: "yes" })));
+  assert.throws(() => parseAgentationEvent(JSON.stringify({ ...snapshot, updatedAt: "now" })));
+  assert.throws(() => parseAgentationEvent(JSON.stringify({ ...snapshot, incarnationId: 1 })));
+
+  const legacy = { ...snapshot };
+  delete (legacy as Partial<typeof snapshot>).settled;
+  delete (legacy as Partial<typeof snapshot>).updatedAt;
+  delete (legacy as Partial<typeof snapshot>).incarnationId;
+  assert.deepEqual(parseAgentationEvent(JSON.stringify(legacy)), legacy);
+});
+
+test("projection settlements build exact generation-bound JSON posts without Origin", () => {
+  const request = projectionSettlementRequest(
+    "http://127.0.0.1:4748/base",
+    "generation-1",
+    "incarnation-1",
+    "task & one",
+    7,
+    true,
+  );
+  assert.equal(request.url.toString(), "http://127.0.0.1:4748/projection-settlements");
+  assert.equal(request.init.method, "POST");
+  assert.deepEqual(request.init.headers, { "content-type": "application/json" });
+  assert.equal(
+    request.init.body,
+    JSON.stringify({
+      generation: "generation-1",
+      incarnationId: "incarnation-1",
+      taskId: "task & one",
+      revision: 7,
+      settled: true,
+    }),
+  );
+  assert.equal(JSON.stringify(request).toLowerCase().includes("origin"), false);
+});
+
+test("projection settlements retry transport failures and parse the returned snapshot", async () => {
+  const request = projectionSettlementRequest(
+    "http://127.0.0.1:4748",
+    "generation-1",
+    "incarnation-1",
+    "task-1",
+    7,
+    true,
+  );
+  const snapshot = {
+    type: "task.snapshot" as const,
+    taskId: "task-1",
+    cwd: "/work/app",
+    annotations: [],
+    revision: 8,
+    status: "completed" as const,
+    detail: "reviewed",
+    settled: true,
+    updatedAt: 1_753_000_000_000,
+    incarnationId: "incarnation-1",
+  };
+  const bodies: (BodyInit | null | undefined)[] = [];
+  const result = await sendProjectionSettlementWithRetry(
+    async (_url, init) => {
+      bodies.push(init.body);
+      if (bodies.length === 1) throw new Error("socket closed after write");
+      return { status: 200, async json() { return snapshot; } };
+    },
+    request.url,
+    request.init,
+    new AbortController().signal,
+  );
+  assert.deepEqual(bodies, [request.init.body, request.init.body]);
+  assert.deepEqual(result, snapshot);
+});
+
+test("projection settlement errors distinguish HTTP statuses and exhausted network retries", async () => {
+  const request = projectionSettlementRequest(
+    "http://127.0.0.1:4748",
+    "generation-1",
+    "incarnation-1",
+    "task-1",
+    7,
+    false,
+  );
+  for (const [status, pattern] of [
+    [400, /invalid/],
+    [404, /unavailable/],
+    [409, /changed/],
+    [410, /expired/],
+  ] as const) {
+    let attempts = 0;
+    await assert.rejects(
+      sendProjectionSettlementWithRetry(
+        async () => {
+          attempts += 1;
+          return { status, async json() { return {}; } };
+        },
+        request.url,
+        request.init,
+        new AbortController().signal,
+      ),
+      (error: unknown) => error instanceof ProjectionSettlementError && pattern.test(error.message),
+    );
+    assert.equal(attempts, 1);
+  }
+
+  let attempts = 0;
+  await assert.rejects(
+    sendProjectionSettlementWithRetry(
+      async () => {
+        attempts += 1;
+        throw new Error("connection refused");
+      },
+      request.url,
+      request.init,
+      new AbortController().signal,
+    ),
+    (error: unknown) => error instanceof ProjectionSettlementError && /server.*running/.test(error.message),
+  );
+  assert.equal(attempts, 2);
 });
 
 test("projection replies build exact JSON posts and distinguish response statuses", () => {
@@ -253,6 +409,32 @@ test("projection rejection errors distinguish stale and unavailable requests", (
   assert.equal(
     new ProjectionRejectionError("prepare", 204).message,
     "Agentation projection rejection prepare returned HTTP 204.",
+  );
+});
+
+test("projectSnapshot orders reused task ids by incarnation timestamp", () => {
+  const previous = projectSnapshot(undefined, {
+    type: "task.snapshot",
+    taskId: "reused",
+    incarnationId: "old",
+    updatedAt: 10,
+    cwd: "/work/app",
+    annotations: [],
+    revision: 20,
+    status: "completed",
+    detail: "old",
+  });
+  const current = projectSnapshot(previous, {
+    ...previous.snapshot,
+    incarnationId: "new",
+    updatedAt: 20,
+    revision: 1,
+    detail: "new",
+  });
+  assert.equal(current.snapshot.incarnationId, "new");
+  assert.equal(
+    projectSnapshot(current, { ...previous.snapshot, revision: 21, updatedAt: 10 }),
+    current,
   );
 });
 

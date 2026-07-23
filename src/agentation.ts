@@ -33,6 +33,9 @@ export type AgentationSnapshot = {
   markdown?: string;
   sessionFile?: string;
   error?: string;
+  settled?: boolean;
+  updatedAt?: number;
+  incarnationId?: string;
 };
 
 export type AgentationReset = {
@@ -161,6 +164,9 @@ export class AgentationProjectionClient {
     }
     this.consume(parser.push(decoder.decode()));
     this.consume(parser.end());
+    if (!this.controller.signal.aborted) {
+      throw new Error("agentation projection stream closed");
+    }
   }
 
   private consume(records: readonly string[]): void {
@@ -214,6 +220,29 @@ export class AgentationProjectionClient {
       init,
       this.controller.signal,
       validate,
+    );
+  }
+
+  async postProjectionSettlement(
+    generation: string,
+    incarnationId: string,
+    taskId: string,
+    revision: number,
+    settled: boolean,
+  ): Promise<AgentationSnapshot> {
+    const { url, init } = projectionSettlementRequest(
+      this.serverUrl,
+      generation,
+      incarnationId,
+      taskId,
+      revision,
+      settled,
+    );
+    return sendProjectionSettlementWithRetry(
+      fetch,
+      url,
+      init,
+      this.controller.signal,
     );
   }
 
@@ -275,7 +304,17 @@ function isSnapshotRegression(
   previous: AgentationSnapshot,
   next: AgentationSnapshot,
 ): boolean {
-  return previous.taskId === next.taskId && next.revision <= previous.revision;
+  if (previous.taskId !== next.taskId) return false;
+  if (previous.incarnationId && next.incarnationId) {
+    if (previous.incarnationId !== next.incarnationId) {
+      return (next.updatedAt ?? 0) <= (previous.updatedAt ?? 0);
+    }
+  } else if (previous.incarnationId && !next.incarnationId) {
+    return true;
+  } else if (!previous.incarnationId && next.incarnationId) {
+    return false;
+  }
+  return next.revision <= previous.revision;
 }
 
 function ensureTrailingSlash(value: string): string {
@@ -359,6 +398,67 @@ export async function sendProjectionReplyWithRetry(
   }
 }
 
+export function projectionSettlementRequest(
+  serverUrl: string,
+  generation: string,
+  incarnationId: string,
+  taskId: string,
+  revision: number,
+  settled: boolean,
+): { url: URL; init: RequestInit } {
+  return jsonPostRequest(serverUrl, "/projection-settlements", {
+    generation,
+    incarnationId,
+    taskId,
+    revision,
+    settled,
+  });
+}
+
+export class ProjectionSettlementError extends Error {
+  constructor(readonly status: 400 | 404 | 409 | 410 | "network" | number) {
+    super(
+      status === "network"
+        ? "Could not reach the Agentation projection server. Check that it is running and try again."
+        : status === 400
+          ? "The Agentation projection settlement request was invalid. Refresh the review and try again."
+          : status === 404
+            ? "Settlements are unavailable for this Agentation projection (HTTP 404)."
+            : status === 409
+              ? "This task changed before its settlement could be saved. Refresh the review and try again."
+              : status === 410
+                ? "This settlement expired because the server projection generation changed. Refresh the review and try again."
+                : `Agentation projection settlement returned HTTP ${status}.`,
+    );
+    this.name = "ProjectionSettlementError";
+  }
+}
+
+export type ProjectionSettlementFetch = (
+  url: URL,
+  init: RequestInit,
+) => Promise<{ status: number; json(): Promise<unknown> }>;
+
+export async function sendProjectionSettlementWithRetry(
+  fetchSettlement: ProjectionSettlementFetch,
+  url: URL,
+  init: RequestInit,
+  signal: AbortSignal,
+): Promise<AgentationSnapshot> {
+  let response: Awaited<ReturnType<ProjectionSettlementFetch>> | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetchSettlement(url, { ...init, signal });
+      break;
+    } catch {
+      if (attempt === 1 || signal.aborted) throw new ProjectionSettlementError("network");
+    }
+  }
+  if (!response) throw new ProjectionSettlementError("network");
+  if (response.status !== 200) throw new ProjectionSettlementError(response.status);
+  return parseAgentationSnapshot(await response.json());
+}
+
 export function projectionRejectionPrepareRequest(
   serverUrl: string,
   generation: string,
@@ -425,7 +525,7 @@ function projectionRequestError(
 function jsonPostRequest(
   serverUrl: string,
   pathname: string,
-  body: Record<string, string>,
+  body: Record<string, unknown>,
 ): { url: URL; init: RequestInit } {
   return {
     url: new URL(pathname, ensureTrailingSlash(serverUrl)),
@@ -443,6 +543,11 @@ export function parseAgentationEvent(record: string): AgentationEvent {
     return event;
   }
   throw new Error("event is not a projection.reset, task.remove, or task.snapshot");
+}
+
+export function parseAgentationSnapshot(value: unknown): AgentationSnapshot {
+  if (!isAgentationSnapshot(value)) throw new Error("response is not a task.snapshot");
+  return value;
 }
 
 function isAgentationRemove(value: unknown): value is AgentationRemove {
@@ -515,6 +620,10 @@ function isAgentationSnapshot(value: unknown): value is AgentationSnapshot {
     typeof snapshot.detail === "string" &&
     (snapshot.markdown === undefined || typeof snapshot.markdown === "string") &&
     (snapshot.sessionFile === undefined || typeof snapshot.sessionFile === "string") &&
-    (snapshot.error === undefined || typeof snapshot.error === "string")
+    (snapshot.error === undefined || typeof snapshot.error === "string") &&
+    (snapshot.settled === undefined || typeof snapshot.settled === "boolean") &&
+    (snapshot.updatedAt === undefined ||
+      (typeof snapshot.updatedAt === "number" && Number.isFinite(snapshot.updatedAt))) &&
+    (snapshot.incarnationId === undefined || typeof snapshot.incarnationId === "string")
   );
 }

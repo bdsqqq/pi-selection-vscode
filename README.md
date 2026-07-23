@@ -1,47 +1,61 @@
 # Pi Selection
 
-A small VS Code/Cursor bridge for sending selected code to independent Pi sessions without interrupting editing.
+A VS Code/VSCodium bridge for running Pi as anchored code-review threads without interrupting editing.
 
-## Architecture
+## Thread inbox
 
-The editor-owned `Cmd+I` workflow is primary: selecting code creates a constrained Pi child session plus a GitHub-style native comment thread anchored to that exact range. New threads start folded. The thread streams Pi messages and tool status, exposes a gutter badge, tracks edits, and sends native replies back into the same Pi session. A clickable inlay and Pi Sessions tree remain alternate views of that session.
+**Pi Threads** is the primary surface. It combines editor-owned selection threads and server-owned Agentation tasks into one feed:
 
-Selection threads persist in versioned, bounded workspace state and return after editor reloads with their matching tree item, gutter status, and clickable inlay. Restore verifies the exact workspace path, source realpath, tracked range fingerprint, and Pi session file before reattaching a thread; stale records fail closed rather than moving onto unrelated code. Interrupted work restores as aborted, while a valid saved session remains replyable. The store retains at most 100 threads and 2 MiB, prioritizing unresolved recent work.
+- **Needs attention** — Pi finished or failed and the loop needs a human decision.
+- **Working** — Pi is queued, running, or handling a follow-up.
+- **Settled** — terminal work the user has explicitly closed.
 
-Agentation is an optional browser/canvas ingress for this project. Its independent server owns browser annotation intake and execution; the editor projects those tasks through the same review primitives without making the editor workflow depend on Agentation. This follows the project direction described in [the original browser/editor/canvas thread](https://x.com/bedesqui/status/2079612948931018821).
+Groups are ordered by urgency, then newest activity. The view badge counts threads needing attention and reports Agentation connection state. A thread can be revealed, replied to, settled, reopened, reviewed, or opened as a Pi session without changing execution ownership.
 
-On extension startup, the editor connects to `GET /projection-events` at `piSelection.agentationServerUrl` (default `http://127.0.0.1:4748`). Idempotent task snapshots replace local task state, including tasks without resolvable source locations. A projection reset removes prior projected tasks before replay without touching selection jobs; task-removal events dispose only their matching projection. Browser annotations with valid source locations become unresolved native comment threads, whole-line code review decorations, and clickable session inlays; every task also appears once in Pi Sessions. Threads show the browser annotation and server conversation in a GitHub-like review flow. After Pi finishes and a session is available, the native reply field submits follow-ups to that session. **Mark Reviewed** resolves the thread and removes its review decoration without mutating server state. Completed tasks with a `sessionFile` open through the same reused terminal-editor path as selection sessions.
+Threads can begin from three ingress points:
 
-When a task snapshot includes changed paths, **Review Changes** fetches generation-bound server projections and opens VS Code's native diff editor. Virtual content uses a 20 MiB, 40-document LRU cache and refetches evicted documents on demand; reset generations expire open diffs instead of reusing stale task identities. The diff editor's **Pi Selection: Reject This File** action prepares a server operation, verifies an existing workspace file still has the exact projected after state, applies one undoable `WorkspaceEdit` to restore it, verifies the result, and then acknowledges the operation. Concurrent local changes, paths outside the task cwd and open workspace, and stale generations fail without acknowledgement. VS Code has no stable version-guarded file deletion API, so task-created files are never deleted automatically: delete the file manually, then use **Mark Reviewed**. After acknowledgement, the extension invalidates both virtual documents and closes the diff; the next projection snapshot removes the change. A Pi Sessions task click opens that review directly for one changed file or asks which file to review; tasks without changes retain the session-opening behavior.
+1. select code and press `Cmd+I` (`Ctrl+I` elsewhere);
+2. click **New Thread** in the Pi Threads title bar, which uses the active editor selection;
+3. submit an annotation through Agentation in the browser.
 
-VS Code's stable Comments API, virtual-document providers, and `TextEditorDecorationType` are review projections, not editable inline suggestions or fake completions. A small status badge occupies the bottom-right of the gutter decoration so the native Comments glyph remains the interaction target where the renderer permits. Decoration icons are not clickable, and VS Code controls how much the two gutter visuals overlap.
+Editor-created comment threads start folded and do not reveal the sidebar or move focus. Clicking a feed row reveals its native anchored thread. Agentation tasks with multiple anchors ask which annotation to reveal; source-less tasks open their task feed.
 
-Selection sessions and projected browser sessions share presentation primitives but not execution ownership: local selections use the editor buffer bridge, while Agentation tasks remain server-owned.
+## Ownership and lifecycle
+
+Local selections are owned by the editor. Each starts a constrained Pi child session; native replies resume that exact session. Local settlement is persisted in bounded workspace state and restored with the matching feed row, comment thread, gutter status, and clickable inlay.
+
+Agentation is optional external ingress. Its server owns task execution, conversation history, changed-file projections, settlement, and timestamps. Editor settlement calls the generation-, incarnation-, and revision-guarded server API; reconnect replay restores canonical state. Replying reopens settled work before the same server-owned Pi session continues. Older Agentation servers remain readable and replyable but cannot settle tasks.
+
+One Agentation task is one logical feed thread; its annotations are source anchors into that shared task. Settling the task resolves all of its native annotation threads.
+
+## Safe editor integration
+
+Selection sessions replace Pi's filesystem mutation path with a VSCodium buffer bridge. Pi receives `read`, `grep`, `find`, `ls`, and `apply_patch`; `edit`, `write`, and `bash` are unavailable. `apply_patch` validates exact, unique, non-overlapping replacements against the current editor buffer, submits one `WorkspaceEdit`, and returns bounded post-edit context. Unrelated concurrent typing and VSCodium undo history are preserved.
+
+Persisted local anchors verify the workspace path, canonical source realpath, surrounding-content fingerprint, and immutable Pi session identity before restoration. Stale records fail closed. Storage is capped at 100 threads and 2 MiB, prioritizing unsettled recent work. Source edits move anchors but do not make old work appear newly active in the feed.
+
+Agentation changed files open through native diff editors backed by generation-bound virtual documents. **Reject This File** verifies the exact projected state before applying one undoable buffer edit and acknowledging the server. Task-created files require manual deletion because stable VS Code APIs cannot version-guard file deletion.
 
 ## Use
 
-1. Install `pi-selection-0.6.2.vsix` with **Extensions: Install from VSIX…**.
+1. Install `pi-selection-0.7.0.vsix` with **Extensions: Install from VSIX…**.
 2. Open a trusted folder where `pi` already works.
-3. Select code and press `Cmd+I` (`Ctrl+I` elsewhere).
-4. Enter an instruction. A folded native comment thread and gutter status badge anchor to the selected range while Pi works.
-5. Reply inside that thread to continue the same Pi session. The clickable inlay, live feed, terminal editor, and Pi Sessions tree remain available as alternate views.
+3. Create a thread from a code selection, the Pi Threads title bar, or Agentation.
+4. Work the **Needs attention** group: reveal or reply, review changes when present, then settle completed work.
+5. Reopen a settled thread whenever another follow-up is needed.
 
-`Cmd+I` intentionally reuses the inline-chat slot; VSCodium's built-in AI features are disabled in this setup. Assign `piSelection.submit` another shortcut in **Preferences: Open Keyboard Shortcuts** if inline chat is enabled.
-
-The extension creates one lightweight parent session per workspace window. Every submitted prompt becomes a named child session linked to that parent, so the sessions remain available through Pi's normal `/resume` interface.
-
-Selection sessions replace Pi's filesystem `read`, `edit`, and `write` path with a VSCodium buffer bridge. Pi receives `read`, `grep`, `find`, `ls`, and `apply_patch`; `edit`, `write`, and `bash` are unavailable. `apply_patch` validates exact, unique, non-overlapping replacements against the current editor buffer, submits one `WorkspaceEdit`, and returns bounded post-edit context. This preserves unrelated concurrent typing and VSCodium's undo history without requiring a verification read.
+`Cmd+I` intentionally reuses the inline-chat slot. Set `piSelection.piPath` when `pi` is not available on the extension host's `PATH`. Agentation defaults to `http://127.0.0.1:4748` and is configured with `piSelection.agentationServerUrl`.
 
 ## Commands
 
 - **Pi: Prompt About Selection**
+- **Reveal Thread**
+- **Reply to Thread**
+- **Settle Thread**
+- **Reopen Thread**
+- **Review Changes**
 - **Pi: Open Session**
 - **Pi: Open Parent Session**
 - **Pi: Abort Session**
-- **Pi: Clear Finished Sessions**
-- **Reply** (selection or projected native comment input)
-- **Mark Reviewed** (selection or projected comment-thread title)
-- **Review Changes** (projected task or Agentation comment-thread title)
-- **Pi Selection: Reject This File** (projected diff editor title)
-
-Set `piSelection.piPath` when `pi` is not available on the extension host's `PATH`.
+- **Pi: Clear Settled Threads**
+- **Pi Selection: Reject This File**
